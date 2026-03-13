@@ -1,27 +1,15 @@
 import customtkinter as ctk
 
-
 def get_rank_sort_key(acc, rank_type):
-    """Parses a rank string or dictionary into a comparable absolute integer score."""
-    rank_data = acc.get(rank_type, 'Unranked')
+    """Parses a RankDTO into a comparable absolute integer score."""
+    rank_data = acc.solo_duo_rank if rank_type == "solo" else acc.flex_rank
 
-    if isinstance(rank_data, dict):
-        tier_str = rank_data.get('tier', 'Unknown').capitalize()
-        div_str = rank_data.get('rank', '')
-        lp_val = rank_data.get('leaguePoints', 0)
-    else:
-        # Fallback if the JSON hasn't been updated yet and is still a string
-        if not rank_data or rank_data == 'Unranked':
-            return -1
-        parts = rank_data.split(" ")
-        tier_str = parts[0].capitalize() if len(parts) > 0 else "Unknown"
-        div_str = parts[1] if len(parts) > 1 else ""
-        lp_val = 0
-        if len(parts) > 2:
-            try:
-                lp_val = int(parts[2].replace("(", ""))
-            except ValueError:
-                pass
+    if not rank_data or rank_data.tier == "UNRANKED":
+        return -1
+        
+    tier_str = rank_data.tier.capitalize()
+    div_str = rank_data.rank
+    lp_val = rank_data.lp
 
     tiers = {"Iron": 0, "Bronze": 1, "Silver": 2, "Gold": 3, "Platinum": 4, "Emerald": 5, "Diamond": 6, "Master": 7,
              "Grandmaster": 8, "Challenger": 9}
@@ -38,7 +26,7 @@ def get_rank_sort_key(acc, rank_type):
     return (tier_val * 10000) + (div_val * 100) + lp_val
 
 def render_lol_view(container, data, copy_callback, add_callback, logo_img=None, row_widgets=None):
-    """Renders the LoL account dashboard with header and add button."""
+    """Renders the LoL account dashboard with header and add button using DTOs."""
     if row_widgets is None:
         row_widgets = {}
     
@@ -57,11 +45,11 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
 
     # Apply sorting dynamically to the data before rendering
     if sort_col == "Riot ID":
-        data.sort(key=lambda x: x.get("account_name", "").lower(), reverse=not sort_asc)
+        data.sort(key=lambda x: x.account_name.lower(), reverse=not sort_asc)
     elif sort_col == "Solo/Duo Rank":
-        data.sort(key=lambda x: get_rank_sort_key(x, "api_solo_duo"), reverse=not sort_asc)
+        data.sort(key=lambda x: get_rank_sort_key(x, "solo"), reverse=not sort_asc)
     elif sort_col == "Flex Rank":
-        data.sort(key=lambda x: get_rank_sort_key(x, "api_flex"), reverse=not sort_asc)
+        data.sort(key=lambda x: get_rank_sort_key(x, "flex"), reverse=not sort_asc)
 
     # Only destroy headers, keep the cached rows
     for widget in container.winfo_children():
@@ -119,15 +107,22 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
     # Dummy label to enforce exact column width matching with the cards below
     ctk.CTkLabel(table_header, text="", width=110).grid(row=0, column=3, padx=15)
 
+    tier_colors = {
+        "IRON": "gray50", "BRONZE": "#cd7f32", "SILVER": "gray75",
+        "GOLD": "#ffd700", "PLATINUM": "#00ced1", "EMERALD": "#50c878",
+        "DIAMOND": "#b9f2ff", "MASTER": "#ff00ff", "GRANDMASTER": "#ff4500",
+        "CHALLENGER": "#ffdf00", "UNRANKED": "gray40"
+    }
+
     # --- Account Cards (Table Rows) ---
     for acc in data:
-        name = acc.get('account_name', 'Unknown')
+        name = acc.account_name
         
         # If we already created this row, just pack it again (which moves it to the bottom, applying the new sort order instantly!)
         if name in row_widgets:
             old_card = row_widgets[name].get('card')
             if old_card and old_card.winfo_exists():
-                if old_card.winfo_parent() == container.winfo_name():
+                if str(old_card.winfo_parent()) == str(container):
                     old_card.pack(fill="x", pady=2, padx=5)
                     continue
                 else:
@@ -151,72 +146,36 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
             'flex_frame': None,
             'display_name': name
         }
-
-        # --- Sub-frames for precise Rank and LP alignment (Left-Aligned Method) ---
-        def create_rank_cell(parent, rank_data, col, dict_key):
-            cell = ctk.CTkFrame(parent, fg_color="transparent")
+        
+        def build_rank_cell(rank_data, col, dict_key):
+            cell = ctk.CTkFrame(card, fg_color="transparent")
             cell.grid(row=0, column=col, padx=15, pady=10, sticky="w")
             row_widgets[name][dict_key] = cell
             
-            is_dict = isinstance(rank_data, dict)
-            rank_string = f"{rank_data.get('tier', 'Unknown').title()} {rank_data.get('rank', '')} ({rank_data.get('leaguePoints', 0)} LP)" if is_dict else str(rank_data)
-            
-            # --- Row 1: Rank and LP ---
-            r_frame = ctk.CTkFrame(cell, fg_color="transparent")
-            r_frame.pack(anchor="w")
-            
-            if "(" in rank_string:
-                rank_part, lp_part = rank_string.split(" (", 1)
-                lp_part = "(" + lp_part
+            if rank_data and rank_data.tier != "UNRANKED":
+                t_color = tier_colors.get(rank_data.tier.upper(), "white")
+                
+                tier_str = f"{rank_data.tier.capitalize()} {rank_data.rank}"
+                ctk.CTkLabel(cell, text=tier_str, text_color=t_color, font=ctk.CTkFont(weight="bold")).pack(side="left", padx=(0, 8))
+                
+                ctk.CTkLabel(cell, text=f"{rank_data.lp} LP", text_color="gray50").pack(side="left", padx=(0, 8))
+                
+                winrate = 0
+                total_games = rank_data.wins + rank_data.losses
+                if total_games > 0:
+                    winrate = int((rank_data.wins / total_games) * 100)
+                
+                wr_color = "gray50"
+                if winrate >= 60: wr_color = "#ff4500"
+                elif winrate >= 55: wr_color = "#32cd32"
+                elif winrate < 48: wr_color = "#ff6347"
+                
+                ctk.CTkLabel(cell, text=f"{winrate}%", text_color=wr_color).pack(side="left")
             else:
-                rank_part = rank_string
-                lp_part = ""
+                ctk.CTkLabel(cell, text="Unranked", text_color="gray50").pack(side="left")
 
-            rank_lbl = ctk.CTkLabel(r_frame, text=rank_part, width=100, anchor="w")
-            rank_lbl.pack(side="left", padx=(0, 5))
-            
-            if lp_part:
-                lp_lbl = ctk.CTkLabel(r_frame, text=lp_part, text_color="gray", width=60, anchor="w")
-                lp_lbl.pack(side="left")
-            else:
-                ctk.CTkLabel(r_frame, text="", width=60).pack(side="left")
-                
-            # --- Decay Warning (Lookahead) ---
-            decay_data = acc.get('decay_solo_duo') if col == 1 else None # Assuming we only really care about Solo/Duo decay for now
-            if decay_data and is_dict:
-                import time
-                calc_time = decay_data.get("calculated_at", 0)
-                bank = decay_data.get("bank", 0)
-                
-                elapsed_seconds = time.time() - calc_time
-                elapsed_days = int(elapsed_seconds / 86400)
-                current_bank = max(0, bank - elapsed_days)
-                
-                if current_bank <= 7:
-                    color = "#cc3333" if current_bank <= 3 else "#d4a017"
-                    decay_lbl = ctk.CTkLabel(r_frame, text=f"⚠️ {current_bank}d", text_color=color, font=ctk.CTkFont(size=11, weight="bold"))
-                    decay_lbl.pack(side="left", padx=(5, 0))
+        build_rank_cell(acc.solo_duo_rank, 1, 'solo_frame')
+        build_rank_cell(acc.flex_rank, 2, 'flex_frame')
 
-            # --- Row 2: Winrate (Only if dictionary) ---
-            if is_dict and "wins" in rank_data and "losses" in rank_data:
-                w = rank_data["wins"]
-                l = rank_data["losses"]
-                total = w + l
-                if total > 0:
-                    wr = (w / total) * 100
-                    
-                    # Color coding
-                    wr_color = "#54B435" if wr >= 53 else ("#d4a017" if wr >= 50 else "#cc3333")
-                    
-                    wr_frame = ctk.CTkFrame(cell, fg_color="transparent")
-                    wr_frame.pack(anchor="w", pady=(2, 0))
-                    
-                    ctk.CTkLabel(wr_frame, text=f"{wr:.1f}% WR", text_color=wr_color, font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(0, 5))
-                    ctk.CTkLabel(wr_frame, text=f"({w}W - {l}L)", text_color="gray60", font=ctk.CTkFont(size=11)).pack(side="left")
-
-        create_rank_cell(card, acc.get('api_solo_duo', 'Unranked'), 1, 'solo_frame')
-        create_rank_cell(card, acc.get('api_flex', 'Unranked'), 2, 'flex_frame')
-
-        login_name = acc.get('login_name', '')
-        copy_btn = ctk.CTkButton(card, text="📋 Copy Login", width=110, command=lambda ln=login_name: copy_callback(ln))
+        copy_btn = ctk.CTkButton(card, text="📋 Copy Login", width=110, command=lambda ln=acc.login_name: copy_callback(ln))
         copy_btn.grid(row=0, column=3, padx=15, pady=10, sticky="e")

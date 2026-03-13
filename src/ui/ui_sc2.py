@@ -2,26 +2,24 @@ import customtkinter as ctk
 
 def get_sc2_stats(acc, target_region, race):
     """
-    Extracts the MMR and display string for a specific region and race.
+    Extracts the MMR and display string for a specific region and race from an SC2AccountDTO.
     Returns: (numeric_mmr, display_string, is_active)
     """
     race_key = race.lower()
-    profiles = acc.get("profiles", [])
-    if not profiles:
-        return (0, "Unranked", False)
-
-    prof = next((p for p in profiles if p.get("region") == target_region), None)
+    
+    # acc is now an SC2AccountDTO, profiles is a List[SC2ProfileDTO]
+    prof = next((p for p in acc.profiles if p.region == target_region), None)
     if not prof:
         return (0, "Unranked", False)
 
     # Check active
-    ranks = prof.get("ranks", {})
-    if race_key in ranks and ranks[race_key].get("league") != "Unranked":
-        mmr = ranks[race_key]["mmr"]
-        return (mmr, f"{mmr} MMR ({ranks[race_key]['league']})", True)
+    ranks = prof.ranks
+    if race_key in ranks and ranks[race_key].league != "Unranked":
+        mmr = ranks[race_key].mmr
+        return (mmr, f"{mmr} MMR ({ranks[race_key].league})", True)
         
-    # Check history
-    history = prof.get("history", {})
+    # Check history (History is still a dict parsed from raw JSON)
+    history = prof.history
     if history:
         def extract_season_num(season_str):
             try: return int(season_str.replace("Season ", ""))
@@ -95,8 +93,8 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
     # --- Data Parsing & Enrichment ---
     enriched_data = []
     for i, acc in enumerate(data):
-        name = acc.get('account_name', 'Unknown')
-        account_id = f"{name}_{acc.get('account_folder_id', i)}"
+        name = acc.account_name
+        account_id = f"{name}_{acc.account_folder_id or i}"
         
         item_data = {
             "acc": acc,
@@ -269,7 +267,7 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
             lbl.grid(row=0, column=idx + 1, padx=15, pady=10, sticky="w")
             row_widgets[account_id]['race_lbls'][race] = lbl
 
-        email = item["acc"].get('email', '')
+        email = item["acc"].email
         
         if is_muted:
             copy_btn = ctk.CTkButton(card, text="📋 Copy Email", width=110, 

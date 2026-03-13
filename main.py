@@ -6,10 +6,9 @@ from PIL import Image
 from src.ui.ui_utils import open_add_modal
 from src.ui.ui_lol import render_lol_view
 from src.ui.ui_sc2 import render_sc2_view
-from src.config import BASE_DIR, LOL_DB_PATH, SC2_DB_PATH, SETTINGS_PATH
+from src.config import BASE_DIR, SETTINGS_PATH
 from src.data_updater import update_sc2_data
 from src.sync_engine import SyncEngine
-from src.db_manager import DBManager
 
 
 class AccountManagerApp(ctk.CTk):
@@ -23,9 +22,6 @@ class AccountManagerApp(ctk.CTk):
         self.updating = {"LoL": False, "SC2": False}
         self.update_start_times = {"LoL": 0, "SC2": 0}
         self.settings = self.load_settings()
-        
-        # Initialize Database Manager
-        self.db = DBManager()
         
         self.load_data()
 
@@ -90,18 +86,17 @@ class AccountManagerApp(ctk.CTk):
 
     def load_data(self):
         """Correctly assigns data to class attributes so they persist."""
-        # Load League of Legends data from SQLite Database
-        try:
-            self.lol_data = self.db.get_full_account_data()
-        except Exception as e:
-            print(f"Error loading LoL data from DB: {e}")
-            self.lol_data = []
+        from src.services.data_service import get_lol_dashboard_data, get_sc2_dashboard_data
 
-        # Load StarCraft II data from JSON
         try:
-            with open(SC2_DB_PATH, "r", encoding="utf-8") as f:
-                self.sc2_data = json.load(f).get("sc2_accounts", [])
-        except (FileNotFoundError, json.JSONDecodeError):
+            # Load League of Legends data via DTOs
+            self.lol_data = get_lol_dashboard_data()
+            
+            # Load StarCraft II data via DTOs
+            self.sc2_data = get_sc2_dashboard_data()
+        except Exception as e:
+            print(f"Error loading data from Service Layer: {e}")
+            self.lol_data = []
             self.sc2_data = []
 
     def load_settings(self):

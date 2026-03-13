@@ -3,7 +3,6 @@ import json
 import threading
 import os
 import re
-from src.config import LOL_DB_PATH, SC2_DB_PATH
 from src.api_clients import RiotClient, BlizzardClient
 
 def get_sc2_account_folders():
