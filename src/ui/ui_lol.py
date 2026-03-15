@@ -1,7 +1,7 @@
 import time
 import customtkinter as ctk
 
-from src.live_tracker import QUEUE_NAMES
+from src.lol.live import QUEUE_NAMES
 
 
 def get_rank_sort_key(acc, rank_type):
