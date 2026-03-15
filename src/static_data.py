@@ -62,6 +62,28 @@ class StaticDataManager:
     def get_local_path(self, version, name):
         return STATIC_DIR / version / f"{name}.json"
 
+    def get_local_version(self):
+        """Returns the first locally cached patch version directory, if any."""
+        if STATIC_DIR.exists():
+            dirs = [d for d in STATIC_DIR.iterdir() if d.is_dir()]
+            if dirs:
+                return dirs[0].name
+        return None
+
+    def get_champion_id_to_name(self) -> dict:
+        """Returns {champion_id: champion_name} from local cache. Falls back to {} if missing."""
+        version = self.get_local_version()
+        if not version:
+            return {}
+        data = load_static_map(version, "champions")
+        result = {}
+        for name, info in data.get("data", {}).items():
+            try:
+                result[int(info["key"])] = name
+            except (KeyError, ValueError):
+                pass
+        return result
+
 def load_static_map(version, data_type):
     """Utility to load a specific map (e.g. 'champions') from local cache."""
     mgr = StaticDataManager()

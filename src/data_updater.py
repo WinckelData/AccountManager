@@ -1,110 +1,141 @@
+import io
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 from src.api_clients import BlizzardClient
 from src.data.database import SessionLocal
 from src.data import crud
 
+_print_lock = threading.Lock()
+
+
+def _retry_commit(db, buf, max_retries=3):
+    """Commit with retry on database locked errors."""
+    delays = [2, 5, 10]
+    for attempt in range(max_retries + 1):
+        try:
+            db.commit()
+            return
+        except Exception as e:
+            if "database is locked" in str(e) and attempt < max_retries:
+                db.rollback()
+                print(f"  [RETRY] Database locked, retrying in {delays[attempt]}s...", file=buf)
+                time.sleep(delays[attempt])
+            else:
+                raise
+
+
 def get_current_patch():
     """Fetches the current live League of Legends patch from Data Dragon."""
     from src.static_data import StaticDataManager
     return StaticDataManager().get_latest_version() or "Unknown"
 
+
 def calculate_decay_bank(puuid, match_history, queue_type):
     """
-    Simulates the decay bank for Diamond+ accounts over the last 30 days.
-    match_history: List of rich match JSON objects.
-    queue_type: 420 for Solo/Duo, 440 for Flex.
+    Computes the decayed-bank balance for a Diamond+ account.
+
+    Rules (simulated over the last 30 days):
+      - Bank starts at 10 days.
+      - Each ranked game played adds 1 banked day (cap 14).
+      - Each calendar day with no ranked game subtracts 1 banked day (floor 0).
+
+    Returns the estimated banked days remaining (int).
     """
     if not match_history:
         return 0
-        
-    # Filter matches for the specific queue and sort by time (oldest first)
-    valid_matches = []
+
+    valid_match_times = []
     for m in match_history:
         info = m.get("info", {})
         if info.get("queueId") == queue_type:
-            valid_matches.append(info.get("gameCreation", 0) / 1000) # Convert ms to seconds
-            
-    valid_matches.sort()
-    
-    if not valid_matches:
-        return 0
+            valid_match_times.append(info.get("gameCreation", 0) / 1000)  # ms -> s
+
+    valid_match_times.sort()
 
     now = time.time()
     thirty_days_ago = now - (30 * 24 * 3600)
-    
-    # We only care about matches played in the last 30 days for current bank simulation
-    recent_matches = [m for m in valid_matches if m > thirty_days_ago]
-    
-    return recent_matches
+    recent = [t for t in valid_match_times if t > thirty_days_ago]
+
+    bank = 10
+    MAX_BANK = 14
+
+    for day_offset in range(30):
+        day_start = thirty_days_ago + (day_offset * 86400)
+        day_end = day_start + 86400
+        games_today = sum(1 for t in recent if day_start <= t < day_end)
+
+        if games_today > 0:
+            bank = min(MAX_BANK, bank + games_today)
+        else:
+            bank = max(0, bank - 1)
+
+    return bank
 
 
-def update_sc2_data(progress_callback=None):
-    load_dotenv()
-    
-    blizz = BlizzardClient()
-    if not blizz.access_token:
-        print("Failed to authenticate with Blizzard API.")
-        return
-
-    print("Fetching live SC2 ranks, GM status, and logging history...\n" + "=" * 60)
-
-    season_cache = {}
+def _sync_single_sc2(account_dict, blizz, season_cache, gm_cache, progress_callback, total_accounts):
+    """
+    Sync a single SC2 account. Called from worker threads.
+    Returns True if any changes were made.
+    Output is buffered per-worker and printed atomically.
+    """
+    buf = io.StringIO()
     db = SessionLocal()
-    
     try:
-        accounts = crud.get_tracked_accounts(db, game_type="SC2")
-        total_accounts = len(accounts)
+        acc_id = account_dict["account_id"]
+        original_account_name = account_dict["account_name"]
+        folder_id = account_dict["folder_id"]
+        profiles = account_dict["profiles"]
+        account_id_str = f"{original_account_name}_{folder_id or acc_id}"
+        has_changes = False
 
-        for i, acc in enumerate(accounts):
-            original_account_name = acc.account_name
-            account_id = f"{original_account_name}_{acc.folder_id or i}"
-            has_changes = False
+        if progress_callback:
+            progress_callback(account_id_str, "SYNCING", False, 0, total_accounts)
 
-            if progress_callback:
-                progress_callback(account_id, "SYNCING", False, i, total_accounts)
+        print(f"\nAccount: {original_account_name}", file=buf)
+        best_name = original_account_name
 
-            print(f"\nAccount: {original_account_name}")
-            best_name = original_account_name
+        for profile_dict in profiles:
+            reg = profile_dict["region_id"]
+            rlm = profile_dict["realm_id"]
+            pid = profile_dict["profile_id"].split("-")[-1] if "-" in profile_dict["profile_id"] else profile_dict["profile_id"]
+            ign = profile_dict["display_name"]
+            profile_db_id = profile_dict["id"]
+            reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(reg, "Unknown")
 
-            for profile in acc.sc2_profiles:
-                reg = profile.region_id
-                rlm = profile.realm_id
-                # The DB stores global ID like '2-1-10215683'. The Blizz API wants just '10215683'.
-                pid = profile.profile_id.split("-")[-1] if "-" in profile.profile_id else profile.profile_id
-                ign = profile.display_name
-                reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(reg, "Unknown")
+            current_season = season_cache.get(reg)
+            is_gm = str(pid) in gm_cache.get(reg, set())
 
-                if reg not in season_cache:
-                    season_cache[reg] = blizz.get_current_season(reg)
-                current_season = season_cache[reg]
+            metadata = blizz.get_profile_metadata(reg, rlm, pid)
+            if "summary" in metadata and "displayName" in metadata["summary"]:
+                ign = metadata["summary"]["displayName"]
+                crud.upsert_sc2_profile(db, acc_id, profile_dict["profile_id"], reg, rlm, ign)
+                if reg == 2:
+                    best_name = ign
 
-                metadata = blizz.get_profile_metadata(reg, rlm, pid)
-                if "summary" in metadata and "displayName" in metadata["summary"]:
-                    ign = metadata["summary"]["displayName"]
-                    crud.upsert_sc2_profile(db, acc.id, profile.profile_id, reg, rlm, ign)
-                    if reg == 2: best_name = ign # Prefer EU name
+            print(f"  -> Profile: {ign} ({reg_name} | ID: {pid}){' [GM]' if is_gm else ''}", file=buf)
 
-                print(f"  -> Profile: {ign} ({reg_name} | ID: {pid})")
-
-                summary = blizz.get_ladder_summary(reg, rlm, pid)
-                if "error" in summary: continue
-
+            summary = blizz.get_ladder_summary(reg, rlm, pid)
+            if "error" not in summary:
                 showcase = summary.get("showCaseEntries", [])
                 for entry in showcase:
                     team = entry.get("team", {})
-                    if team.get("localizedGameMode") != "1v1": continue
+                    if team.get("localizedGameMode") != "1v1":
+                        continue
 
                     members = team.get("members", [])
-                    if not members: continue
+                    if not members:
+                        continue
 
                     race = members[0].get("favoriteRace", "").lower()
-                    if race not in ["terran", "zerg", "protoss", "random"]: continue
+                    if race not in ["terran", "zerg", "protoss", "random"]:
+                        continue
 
                     ladder_id = entry.get("ladderId")
                     league = entry.get("leagueName", "UNKNOWN").capitalize()
-                    
+
                     ladder_details = blizz.get_ladder_details(reg, rlm, pid, ladder_id)
                     mmr = 0
                     for ladder_team in ladder_details.get("ladderTeams", []):
@@ -113,44 +144,143 @@ def update_sc2_data(progress_callback=None):
                             mmr = ladder_team.get("mmr", 0)
                             break
 
-                    # Upsert Ranks
                     crud.upsert_sc2_ranks(
                         db=db,
-                        profile_id=profile.id,
+                        profile_id=profile_db_id,
                         season=current_season,
                         race=race,
                         queue_type="1v1",
                         mmr=mmr,
-                        league=league
+                        league=league,
+                        is_grandmaster=is_gm,
                     )
-                    time.sleep(0.1)
                     has_changes = True
 
-                # Upsert Raw Data
-                history = profile.raw_data.match_history if profile.raw_data else {}
-                crud.upsert_sc2_raw_data(
-                    db=db,
-                    profile_id=profile.id,
-                    profile_summary=metadata.get("summary", {}),
-                    ladder_summary=summary,
-                    match_history=history # We retain the existing history for now
-                )
-                
-            # Update Account Name if EU profile name changed
-            if best_name != original_account_name:
-                crud.update_account(db, acc.id, account_name=best_name)
-                has_changes = True
-                
-            db.commit()
+            # Fetch live match history (last 25 matches)
+            print(f"  -> Fetching match history for {ign}...", file=buf)
+            live_history = blizz.get_match_history(reg, rlm, pid)
 
-            if progress_callback:
-                progress_callback(account_id, "DONE", has_changes, i + 1, total_accounts)
+            # Store raw data
+            crud.upsert_sc2_raw_data(
+                db=db,
+                profile_id=profile_db_id,
+                profile_summary=metadata.get("summary", {}),
+                ladder_summary=summary,
+                match_history=live_history if live_history else {},
+            )
+
+            # Extract structured SC2 matches
+            if live_history:
+                n = crud.upsert_sc2_matches(db, profile_db_id, live_history)
+                if n:
+                    print(f"  -> Upserted {n} new SC2 match records for {ign}", file=buf)
+
+            # Commit after each profile to minimize transaction hold time
+            _retry_commit(db, buf)
+
+        # Update Account Name if EU profile name changed
+        if best_name != original_account_name:
+            crud.update_account(db, acc_id, account_name=best_name)
+            _retry_commit(db, buf)
+            has_changes = True
+        return account_id_str, has_changes
 
     except Exception as e:
         db.rollback()
-        print(f"SC2 Sync Error: {e}")
+        print(f"  [ERROR] Sync failed for {account_dict['account_name']}: {e}", file=buf)
+        return account_dict.get("account_name", "unknown"), False
     finally:
         db.close()
+        with _print_lock:
+            print(buf.getvalue(), end="")
+
+
+def update_sc2_data(progress_callback=None):
+    load_dotenv()
+
+    blizz = BlizzardClient()
+    if not blizz.access_token:
+        print("Failed to authenticate with Blizzard API.")
+        return
+
+    print("Fetching live SC2 ranks, GM status, and logging history...\n" + "=" * 60)
+
+    db = SessionLocal()
+    try:
+        accounts = crud.get_tracked_accounts(db, game_type="SC2")
+
+        # Pre-populate season and GM caches (region-level, shared across workers)
+        season_cache = {}
+        gm_cache = {}
+        regions_seen = set()
+        for acc in accounts:
+            for profile in acc.sc2_profiles:
+                regions_seen.add(profile.region_id)
+
+        for reg in regions_seen:
+            season_cache[reg] = blizz.get_current_season(reg)
+            reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(reg, "Unknown")
+            print(f"  -> Fetching GM ladder for region {reg_name}...")
+            gm_data = blizz.get_grandmaster_ladder(reg)
+            gm_ids = set()
+            for team in gm_data.get("ladderTeams", []):
+                for member in team.get("teamMembers", []):
+                    gm_ids.add(str(member.get("id", "")))
+            gm_cache[reg] = gm_ids
+
+        # Build account dicts (eager-load to avoid DetachedInstanceError in workers)
+        account_dicts = []
+        for acc in accounts:
+            account_dicts.append({
+                "account_id": acc.id,
+                "account_name": acc.account_name,
+                "folder_id": acc.folder_id,
+                "profiles": [
+                    {
+                        "id": p.id,
+                        "profile_id": p.profile_id,
+                        "region_id": p.region_id,
+                        "realm_id": p.realm_id,
+                        "display_name": p.display_name,
+                    }
+                    for p in acc.sc2_profiles
+                ],
+            })
+    finally:
+        db.close()
+
+    if not account_dicts:
+        print("No tracked SC2 accounts found.")
+        return
+
+    total_accounts = len(account_dicts)
+    completed = [0]
+    completed_lock = threading.Lock()
+
+    def wrapped_progress(account_id_str, status, has_changes, _cur, _tot):
+        if progress_callback:
+            with completed_lock:
+                cur = completed[0]
+                if status == "DONE":
+                    completed[0] += 1
+                    cur = completed[0]
+            progress_callback(account_id_str, status, has_changes, cur, total_accounts)
+
+    # Parallel sync: up to 8 workers (Blizzard limits are 100 req/s, each account ~10-15 calls)
+    num_workers = min(8, total_accounts)
+    print(f"[SC2 Sync] {total_accounts} accounts, {num_workers} worker(s)\n" + "=" * 60)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {
+            executor.submit(
+                _sync_single_sc2,
+                acc_dict, blizz, season_cache, gm_cache, wrapped_progress, total_accounts
+            ): acc_dict
+            for acc_dict in account_dicts
+        }
+        for future in as_completed(futures):
+            account_id_str, has_changes = future.result()
+            wrapped_progress(account_id_str, "DONE", has_changes, 0, total_accounts)
 
     print("\n" + "=" * 60)
     print("SC2 Database successfully updated via ORM!")
