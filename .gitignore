@@ -29,3 +29,7 @@ tests/
 
 # Logs
 *.log
+
+# AI assistant instructions (local only)
+CLAUDE.md
+GEMINI.md
