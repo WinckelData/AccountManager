@@ -1,3 +1,4 @@
+import time
 import customtkinter as ctk
 
 def get_sc2_stats(acc, target_region, race):
@@ -34,16 +35,23 @@ def get_sc2_stats(acc, target_region, race):
     return (0, "Unranked", False)
 
 
-def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None, row_widgets=None):
+def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None, row_widgets=None,
+                    live_tracking_enabled=False, live_tracking_toggle_cb=None):
     """Renders the SC2 account dashboard using the Compact Grid layout with Sorting and Spoilers."""
     if row_widgets is None:
         row_widgets = {}
-    
+
     # --- State Management ---
     if not hasattr(container, "selected_server"):
         container.selected_server = "EU"
     if not hasattr(container, "selected_races"):
         container.selected_races = {"Zerg": True, "Terran": False, "Protoss": False}
+    # Persist live tracking state across internal re-renders
+    if live_tracking_toggle_cb is not None:
+        container._live_tracking_enabled = live_tracking_enabled
+        container._live_tracking_toggle_cb = live_tracking_toggle_cb
+    _live_enabled = getattr(container, "_live_tracking_enabled", False)
+    _live_cb = getattr(container, "_live_tracking_toggle_cb", None)
         
     selected_server = container.selected_server
     selected_races = container.selected_races
@@ -131,6 +139,17 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
             reverse=not sort_asc
         )
 
+    # Pin live or post-game accounts to top (only when live tracking is active)
+    if _live_enabled:
+        def _pin_key(x):
+            for p in x["acc"].profiles:
+                if p.is_in_game:
+                    return 0  # in-game: highest priority
+                if p.last_game_result is not None:
+                    return 0  # post-game result: keep pinned
+            return 1
+        enriched_data.sort(key=_pin_key)
+
     # Separate empty accounts after sorting
     active_data = [d for d in enriched_data if not d["is_empty"]]
     empty_data = [d for d in enriched_data if d["is_empty"]]
@@ -160,6 +179,14 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
 
     title = ctk.CTkLabel(header_frame, text="StarCraft II Accounts", font=ctk.CTkFont(size=32, weight="bold"))
     title.pack(side="left")
+
+    if _live_cb is not None:
+        live_var = ctk.BooleanVar(value=_live_enabled)
+        def _on_live_toggle():
+            container._live_tracking_enabled = live_var.get()
+            _live_cb(live_var.get())
+        ctk.CTkCheckBox(header_frame, text="Live Tracking", variable=live_var,
+                        command=_on_live_toggle, font=ctk.CTkFont(size=12)).pack(side="right", padx=10)
 
     add_btn = ctk.CTkButton(header_frame, text="+ Add Account", fg_color="#1f538d", hover_color="#14375e",
                             height=35, command=add_callback)
@@ -252,10 +279,65 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
 
         base_text_color = "gray60" if is_muted else ("gray10", "gray90")
 
-        name_lbl = ctk.CTkLabel(card, text=item["name"], font=ctk.CTkFont(size=14, weight="bold"), 
-                     text_color=base_text_color, width=200, anchor="w")
-        name_lbl.grid(row=0, column=0, padx=15, pady=10, sticky="w")
+        # Check if any profile for this account is in-game or has post-game result
+        acc_obj = item["acc"]
+        in_game_profile = next((p for p in acc_obj.profiles if p.is_in_game), None)
+        result_profile = next((p for p in acc_obj.profiles if p.last_game_result is not None), None)
+
+        name_cell = ctk.CTkFrame(card, fg_color="transparent")
+        name_cell.grid(row=0, column=0, padx=15, pady=(8, 4), sticky="w")
+
+        name_row = ctk.CTkFrame(name_cell, fg_color="transparent")
+        name_row.pack(anchor="w")
+
+        name_lbl = ctk.CTkLabel(name_row, text=item["name"], font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=base_text_color)
+        name_lbl.pack(side="left")
         row_widgets[account_id]['name_lbl'] = name_lbl
+
+        if not is_muted:
+            if in_game_profile:
+                ctk.CTkLabel(name_row, text=" 🔴 LIVE",
+                             text_color="#ff4500",
+                             font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(6, 0))
+            elif result_profile:
+                result_map = {
+                    "Victory": ("✅ Victory", "#2ea043"),
+                    "Defeat": ("❌ Defeat", "#da3633"),
+                    "Tie": ("➖ Tie", "#d4a017"),
+                }
+                badge_text, badge_color = result_map.get(
+                    result_profile.last_game_result, (result_profile.last_game_result, "gray50")
+                )
+                ctk.CTkLabel(name_row, text=f" {badge_text}",
+                             text_color=badge_color,
+                             font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(6, 0))
+
+        # Sub-row: opponent and game timer
+        if not is_muted:
+            show_profile = in_game_profile or result_profile
+            if show_profile:
+                sub_row = ctk.CTkFrame(name_cell, fg_color="transparent")
+                sub_row.pack(anchor="w")
+
+                # Opponent name: use live opponent if in-game, else post-game opponent
+                opponent = None
+                if in_game_profile:
+                    opponent = in_game_profile.current_opponent
+                elif result_profile:
+                    opponent = result_profile.last_game_opponent
+                if opponent:
+                    ctk.CTkLabel(sub_row, text=f"vs {opponent}",
+                                 text_color="gray50", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 6))
+
+                # Timer (only while in-game)
+                if in_game_profile and in_game_profile.current_game_start:
+                    elapsed_s = int((time.time() * 1000 - in_game_profile.current_game_start) / 1000)
+                    mins, secs = divmod(max(0, elapsed_s), 60)
+                    timer_lbl = ctk.CTkLabel(sub_row, text=f"|  {mins}:{secs:02d}",
+                                 text_color="gray50", font=ctk.CTkFont(size=11))
+                    timer_lbl.pack(side="left")
+                    row_widgets[account_id]['timer_lbl'] = timer_lbl
 
         for idx, race in enumerate(active_races):
             stats = item["stats"][race]

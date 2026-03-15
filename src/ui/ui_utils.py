@@ -1,9 +1,10 @@
 import customtkinter as ctk
-import json
 import threading
 import os
 import re
-from src.api_clients import RiotClient, BlizzardClient
+from src.api_clients import RiotClient
+from src.data.database import SessionLocal
+from src.data import crud
 
 def get_sc2_account_folders():
     """Scans the SC2 Documents directory for root account folders."""
@@ -132,14 +133,13 @@ def open_add_modal(app):
 
             # Insert as PENDING so SyncEngine resolves the real Platform PUUID on next sync
             dummy_puuid = f"PENDING_{name}_{tag}"
-            
+
             try:
-                app.db.upsert_account(
-                    puuid=dummy_puuid,
-                    game_name=name,
-                    tag_line=tag,
-                    login_name=login
-                )
+                db = SessionLocal()
+                account = crud.create_account(db, game_type="LOL", account_name=name, login_name=login)
+                crud.upsert_lol_profile(db, account_id=account.id, puuid=dummy_puuid, game_name=name, tag_line=tag)
+                db.commit()
+                db.close()
             except Exception as e:
                 app.after(0, finish_verification, f"Database Error: {e}")
                 return
@@ -148,50 +148,55 @@ def open_add_modal(app):
 
         else: # SC2
             folder_selection = data_entries['folder'].get()
-            if folder_selection == "No local SC2 accounts found.":
+            if not folder_selection or folder_selection == "No local SC2 accounts found.":
                 app.after(0, finish_verification, "No folder selected.")
                 return
-                
+
             folder_id = folder_selection.split(" ")[0]
             email = data_entries['email'].get().strip()
-            alias = data_entries['alias'].get().strip() or "Unknown"
-            
+
             if not email:
                 app.after(0, finish_verification, "Email is required.")
                 return
-                
+
             base_dir = os.path.expanduser(f'~/Documents/StarCraft II/Accounts/{folder_id}')
             profiles_found = []
-            
+
             for root, dirs, files in os.walk(base_dir):
                 match = re.search(r'(\d)-S2-(\d)-(\d+)', root)
                 if match:
                     reg_id, realm_id, prof_id = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    composite_id = f"{reg_id}-{realm_id}-{prof_id}"
                     # Prevent duplicates if multiple subfolders refer to the same profile
-                    if not any(p['region'] == reg_id and p['profile_id'] == prof_id for p in profiles_found):
+                    if not any(p['composite_id'] == composite_id for p in profiles_found):
                         profiles_found.append({
+                            "composite_id": composite_id,
                             "region": reg_id,
                             "realm": realm_id,
                             "profile_id": prof_id,
-                            "in_game_name": alias, 
-                            "ranks": {}
                         })
-            
+
             if not profiles_found:
                 app.after(0, finish_verification, "No valid profiles found in that folder.")
                 return
 
-            new_entry = {
-                "game": "SC2",
-                "account_name": alias,
-                "email": email,
-                "account_folder_id": folder_id,
-                "profiles": profiles_found
-            }
-            app.sc2_data.append(new_entry)
-            
-            with open(SC2_DB_PATH, "w", encoding="utf-8") as f:
-                json.dump({"sc2_accounts": app.sc2_data}, f, indent=4)
+            try:
+                db = SessionLocal()
+                account = crud.create_account(db, game_type="SC2", account_name=email, login_name=email, folder_id=folder_id)
+                for p in profiles_found:
+                    crud.upsert_sc2_profile(
+                        db,
+                        account_id=account.id,
+                        profile_id=p["composite_id"],
+                        region_id=p["region"],
+                        realm_id=p["realm"],
+                        display_name=email,  # Blizzard API will update the real name on next sync
+                    )
+                db.commit()
+                db.close()
+            except Exception as e:
+                app.after(0, finish_verification, f"Database Error: {e}")
+                return
 
             app.after(0, finish_success)
 
