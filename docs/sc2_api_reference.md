@@ -93,6 +93,33 @@ Requests must be routed to the specific regional server where the profile reside
 
 ---
 
+---
+
+## Rate Limit Findings
+
+_Measured 2026-03-15 using `tests/test_blizzard_rate_limits.py`_
+
+### Documented Limits
+- **Per-second:** 100 requests/second
+- **Per-hour:** 36,000 requests/hour
+
+### Observed Behavior
+- **No rate-limit headers returned** — Blizzard does not send `X-RateLimit-*`, `Retry-After`, or similar headers on normal responses. The `Retry-After` header only appears on actual `429` responses.
+- **Very generous burst buffer** — A 300-request concurrent burst (multithreaded) completed without triggering any `429` responses, indicating a large burst allowance or average-based throttling rather than a strict per-second hard cutoff.
+- **Sustained load** — 75 sequential requests averaged ~80–200 ms per call (region-dependent). No throttling observed at this rate.
+
+### Implementation Notes
+- `BlizzardClient` uses a proactive sliding-window counter (`deque`) tracking the last 1 second and last 1 hour of requests.
+- Configured with conservative thresholds: 95 req/s and 35,000 req/hr (both slightly below documented limits).
+- Since Blizzard's burst buffer appears very large, the effective constraint for this app is the **per-hour limit** (35,000 guard rail).
+- With ~6–10 API calls per SC2 account sync, even 1,000 accounts can be synced comfortably within the hourly budget.
+
+### Parallelism Recommendation
+- **3 workers** is a safe default for parallel SC2 sync (used in `data_updater.py`).
+- Could increase to 5–10 workers without risk of hitting rate limits for typical account counts.
+
+---
+
 ## 2. Game Data APIs (Global State)
 
 ### A. Get League Data
