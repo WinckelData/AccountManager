@@ -17,10 +17,8 @@ import threading
 import time
 
 import requests
-from sqlalchemy import select
 
 from src.data.database import SessionLocal
-from src.data.models import SC2Profile
 from src.data import crud
 
 SC2_GAME_URL = "http://localhost:6119/game"
@@ -129,7 +127,7 @@ class SC2Live:
         # --- In-game: update DB with live status ---
         db = SessionLocal()
         try:
-            profiles = db.execute(select(SC2Profile)).scalars().all()
+            profiles = crud.get_all_sc2_display_names(db)
             player_names = [p.get("name", "") for p in players]
 
             for profile in profiles:
@@ -178,7 +176,7 @@ class SC2Live:
 
         db = SessionLocal()
         try:
-            profiles = db.execute(select(SC2Profile)).scalars().all()
+            profiles = crud.get_all_sc2_display_names(db)
             player_names = [p.get("name", "") for p in players]
 
             for profile in profiles:
@@ -228,7 +226,7 @@ class SC2Live:
         self._last_players = None
         db = SessionLocal()
         try:
-            profiles = db.execute(select(SC2Profile)).scalars().all()
+            profiles = crud.get_all_sc2_display_names(db)
             for profile in profiles:
                 crud.set_sc2_in_game_status(db, profile.id, False, clear_result=True)
             db.commit()

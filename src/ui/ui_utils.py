@@ -2,9 +2,7 @@ import customtkinter as ctk
 import threading
 import os
 import re
-from src.api_clients import RiotClient
-from src.data.database import SessionLocal
-from src.data import crud
+from src.services.data_service import add_lol_account, add_sc2_account
 
 def get_sc2_account_folders():
     """Scans the SC2 Documents directory for root account folders."""
@@ -109,39 +107,9 @@ def open_add_modal(app):
                 app.after(0, finish_verification, "Game Name and Tagline are required.")
                 return
 
-            client = RiotClient(
-                primary_key=os.getenv("RIOT_API_KEY_PRIMARY"),
-                fallback_key=os.getenv("RIOT_API_KEY_FALLBACK")
-            )
-
-            # Map region based on simple logic
-            tag_upper = tag.upper()
-            if tag_upper in ["EUW", "EUW1", "EUNE"]:
-                region = "europe"
-            elif tag_upper in ["NA", "NA1"]:
-                region = "americas"
-            elif tag_upper in ["KR", "KR1"]:
-                region = "asia"
-            else:
-                region = "europe"
-
-            account_data = client.get_puuid_by_riot_id(region, name, tag)
-
-            if not account_data or "puuid" not in account_data:
-                app.after(0, finish_verification, "API Error: Could not resolve Riot ID.")
-                return
-
-            # Insert as PENDING so SyncEngine resolves the real Platform PUUID on next sync
-            dummy_puuid = f"PENDING_{name}_{tag}"
-
-            try:
-                db = SessionLocal()
-                account = crud.create_account(db, game_type="LOL", account_name=name, login_name=login)
-                crud.upsert_lol_profile(db, account_id=account.id, puuid=dummy_puuid, game_name=name, tag_line=tag)
-                db.commit()
-                db.close()
-            except Exception as e:
-                app.after(0, finish_verification, f"Database Error: {e}")
+            success, error = add_lol_account(login, name, tag)
+            if not success:
+                app.after(0, finish_verification, error)
                 return
 
             app.after(0, finish_success)
@@ -159,43 +127,9 @@ def open_add_modal(app):
                 app.after(0, finish_verification, "Email is required.")
                 return
 
-            base_dir = os.path.expanduser(f'~/Documents/StarCraft II/Accounts/{folder_id}')
-            profiles_found = []
-
-            for root, dirs, files in os.walk(base_dir):
-                match = re.search(r'(\d)-S2-(\d)-(\d+)', root)
-                if match:
-                    reg_id, realm_id, prof_id = int(match.group(1)), int(match.group(2)), int(match.group(3))
-                    composite_id = f"{reg_id}-{realm_id}-{prof_id}"
-                    # Prevent duplicates if multiple subfolders refer to the same profile
-                    if not any(p['composite_id'] == composite_id for p in profiles_found):
-                        profiles_found.append({
-                            "composite_id": composite_id,
-                            "region": reg_id,
-                            "realm": realm_id,
-                            "profile_id": prof_id,
-                        })
-
-            if not profiles_found:
-                app.after(0, finish_verification, "No valid profiles found in that folder.")
-                return
-
-            try:
-                db = SessionLocal()
-                account = crud.create_account(db, game_type="SC2", account_name=email, login_name=email, folder_id=folder_id)
-                for p in profiles_found:
-                    crud.upsert_sc2_profile(
-                        db,
-                        account_id=account.id,
-                        profile_id=p["composite_id"],
-                        region_id=p["region"],
-                        realm_id=p["realm"],
-                        display_name=email,  # Blizzard API will update the real name on next sync
-                    )
-                db.commit()
-                db.close()
-            except Exception as e:
-                app.after(0, finish_verification, f"Database Error: {e}")
+            success, error = add_sc2_account(folder_id, email)
+            if not success:
+                app.after(0, finish_verification, error)
                 return
 
             app.after(0, finish_success)

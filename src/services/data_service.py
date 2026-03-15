@@ -1,5 +1,7 @@
+import os
+import re
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload, Session
@@ -12,6 +14,48 @@ from src.schemas import (
     SC2AccountDTO, SC2ProfileDTO, SC2RankDTO,
 )
 from src.static_data import StaticDataManager
+
+def calculate_decay_bank(puuid, match_history, queue_type):
+    """
+    Computes the decayed-bank balance for a Diamond+ account.
+
+    Rules (simulated over the last 30 days):
+      - Bank starts at 10 days.
+      - Each ranked game played adds 1 banked day (cap 14).
+      - Each calendar day with no ranked game subtracts 1 banked day (floor 0).
+
+    Returns the estimated banked days remaining (int).
+    """
+    if not match_history:
+        return 0
+
+    valid_match_times = []
+    for m in match_history:
+        info = m.get("info", {})
+        if info.get("queueId") == queue_type:
+            valid_match_times.append(info.get("gameCreation", 0) / 1000)
+
+    valid_match_times.sort()
+
+    now = time.time()
+    thirty_days_ago = now - (30 * 24 * 3600)
+    recent = [t for t in valid_match_times if t > thirty_days_ago]
+
+    bank = 10
+    MAX_BANK = 14
+
+    for day_offset in range(30):
+        day_start = thirty_days_ago + (day_offset * 86400)
+        day_end = day_start + 86400
+        games_today = sum(1 for t in recent if day_start <= t < day_end)
+
+        if games_today > 0:
+            bank = min(MAX_BANK, bank + games_today)
+        else:
+            bank = max(0, bank - 1)
+
+    return bank
+
 
 _LP_PER_RANK = {"IV": 0, "III": 100, "II": 200, "I": 300}
 _TIER_LP = {
@@ -213,5 +257,106 @@ def get_sc2_dashboard_data() -> List[SC2AccountDTO]:
 
             dtos.append(account_dto)
         return dtos
+    finally:
+        db.close()
+
+
+# --- Account Management ---
+
+def add_lol_account(login_name: str, game_name: str, tag_line: str) -> Tuple[bool, str]:
+    """Verify a LoL Riot ID via API and create the account.
+
+    Returns (success, error_message).
+    """
+    from src.api_clients import RiotClient
+
+    client = RiotClient(
+        primary_key=os.getenv("RIOT_API_KEY_PRIMARY"),
+        fallback_key=os.getenv("RIOT_API_KEY_FALLBACK"),
+    )
+
+    tag_upper = tag_line.upper()
+    if tag_upper in ("EUW", "EUW1", "EUNE"):
+        region = "europe"
+    elif tag_upper in ("NA", "NA1"):
+        region = "americas"
+    elif tag_upper in ("KR", "KR1"):
+        region = "asia"
+    else:
+        region = "europe"
+
+    account_data = client.get_puuid_by_riot_id(region, game_name, tag_line)
+    if not account_data or "puuid" not in account_data:
+        return False, "API Error: Could not resolve Riot ID."
+
+    dummy_puuid = f"PENDING_{game_name}_{tag_line}"
+
+    db = SessionLocal()
+    try:
+        account = crud.create_account(db, game_type="LOL", account_name=game_name, login_name=login_name)
+        crud.upsert_lol_profile(db, account_id=account.id, puuid=dummy_puuid, game_name=game_name, tag_line=tag_line)
+        db.commit()
+        return True, ""
+    except Exception as e:
+        db.rollback()
+        return False, f"Database Error: {e}"
+    finally:
+        db.close()
+
+
+def add_sc2_account(folder_id: str, email: str) -> Tuple[bool, str]:
+    """Scan a local SC2 account folder and create the account with profiles.
+
+    Returns (success, error_message).
+    """
+    base_dir = os.path.expanduser(f"~/Documents/StarCraft II/Accounts/{folder_id}")
+    profiles_found = []
+
+    for root, dirs, files in os.walk(base_dir):
+        match = re.search(r"(\d)-S2-(\d)-(\d+)", root)
+        if match:
+            reg_id, realm_id, prof_id = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            composite_id = f"{reg_id}-{realm_id}-{prof_id}"
+            if not any(p["composite_id"] == composite_id for p in profiles_found):
+                profiles_found.append({
+                    "composite_id": composite_id,
+                    "region": reg_id,
+                    "realm": realm_id,
+                    "profile_id": prof_id,
+                })
+
+    if not profiles_found:
+        return False, "No valid profiles found in that folder."
+
+    db = SessionLocal()
+    try:
+        account = crud.create_account(db, game_type="SC2", account_name=email, login_name=email, folder_id=folder_id)
+        for p in profiles_found:
+            crud.upsert_sc2_profile(
+                db,
+                account_id=account.id,
+                profile_id=p["composite_id"],
+                region_id=p["region"],
+                realm_id=p["realm"],
+                display_name=email,
+            )
+        db.commit()
+        return True, ""
+    except Exception as e:
+        db.rollback()
+        return False, f"Database Error: {e}"
+    finally:
+        db.close()
+
+
+def delete_account(account_id: int) -> None:
+    """Delete an account and all associated data."""
+    db = SessionLocal()
+    try:
+        crud.delete_account(db, account_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()

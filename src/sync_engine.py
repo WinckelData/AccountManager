@@ -6,7 +6,6 @@ from dotenv import load_dotenv
 from src.api_clients import RiotClient
 from src.data.database import SessionLocal
 from src.data import crud
-from src.data.models import LoLMatch
 
 
 class SyncEngine:
@@ -136,11 +135,7 @@ class SyncEngine:
 
             # Update the PENDING stub's PUUID in-place so the upsert's
             # ON CONFLICT(puuid) will match, preserving any related rows.
-            from src.data.models import LoLProfile
-            db.query(LoLProfile).filter(LoLProfile.id == profile_id).update(
-                {"puuid": puuid}
-            )
-            db.flush()
+            crud.update_lol_profile_puuid(db, profile_id, puuid)
 
             crud.upsert_lol_profile(
                 db=db,
@@ -178,11 +173,7 @@ class SyncEngine:
 
                 # Update the PUUID in-place to preserve ranks, masteries,
                 # and match participations (avoid cascade-delete).
-                from src.data.models import LoLProfile
-                db.query(LoLProfile).filter(LoLProfile.id == profile_id).update(
-                    {"puuid": puuid}
-                )
-                db.flush()
+                crud.update_lol_profile_puuid(db, profile_id, puuid)
 
             crud.upsert_lol_profile(
                 db=db,
@@ -247,13 +238,7 @@ class SyncEngine:
         print("   - Fetching Match History...")
         known_ids = set(crud.get_lol_match_ids(db, profile_id))
 
-        oldest_match = (
-            db.query(LoLMatch)
-            .join(LoLMatch.participations)
-            .filter(LoLMatch.participations.any(profile_id=profile_id))
-            .order_by(LoLMatch.game_creation.asc())
-            .first()
-        )
+        oldest_match = crud.get_earliest_match_creation(db, profile_id)
         oldest_local_time = oldest_match.game_creation if oldest_match else None
 
         # Phase 1: Frontier (new matches)
@@ -295,13 +280,7 @@ class SyncEngine:
                     known_ids.update(new_ids)
                     has_changes = True
 
-                oldest_match = (
-                    db.query(LoLMatch)
-                    .join(LoLMatch.participations)
-                    .filter(LoLMatch.participations.any(profile_id=profile_id))
-                    .order_by(LoLMatch.game_creation.asc())
-                    .first()
-                )
+                oldest_match = crud.get_earliest_match_creation(db, profile_id)
                 new_oldest_time = oldest_match.game_creation if oldest_match else None
 
                 if new_oldest_time is None or new_oldest_time >= current_end_time:

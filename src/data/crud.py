@@ -614,6 +614,41 @@ def upsert_sc2_matches(db: Session, profile_id: int, match_history: dict) -> int
     return new_count
 
 
+# --- LoL Query Helpers ---
+
+def get_earliest_match_creation(db: Session, profile_id: int) -> Optional[LoLMatch]:
+    """Fetch the oldest LoL match for a profile (by game_creation ascending)."""
+    from sqlalchemy.orm import aliased
+    stmt = (
+        select(LoLMatch)
+        .join(LoLMatchParticipant, LoLMatch.match_id == LoLMatchParticipant.match_id)
+        .where(LoLMatchParticipant.profile_id == profile_id)
+        .order_by(LoLMatch.game_creation.asc())
+        .limit(1)
+    )
+    return db.execute(stmt).scalar_one_or_none()
+
+
+def get_lol_match_by_id(db: Session, match_id: str) -> Optional[LoLMatch]:
+    """Fetch a LoL match by its match_id."""
+    return db.execute(select(LoLMatch).where(LoLMatch.match_id == match_id)).scalar_one_or_none()
+
+
+def update_lol_profile_puuid(db: Session, profile_id: int, new_puuid: str) -> None:
+    """Update the PUUID for a LoL profile by its DB id."""
+    db.execute(
+        update(LoLProfile)
+        .where(LoLProfile.id == profile_id)
+        .values(puuid=new_puuid)
+    )
+    db.flush()
+
+
+def get_all_sc2_display_names(db: Session) -> List[SC2Profile]:
+    """Fetch all SC2 profiles (id and display_name)."""
+    return list(db.execute(select(SC2Profile)).scalars().all())
+
+
 # --- Rank Snapshot Queries ---
 
 def get_lol_rank_snapshots(
