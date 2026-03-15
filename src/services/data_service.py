@@ -268,7 +268,7 @@ def add_lol_account(login_name: str, game_name: str, tag_line: str) -> Tuple[boo
 
     Returns (success, error_message).
     """
-    from src.api_clients import RiotClient
+    from src.lol.api_client import RiotClient
 
     client = RiotClient(
         primary_key=os.getenv("RIOT_API_KEY_PRIMARY"),

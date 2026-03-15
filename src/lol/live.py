@@ -12,7 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
-from src.api_clients import RiotClient
+from src.lol.api_client import RiotClient
 from src.data.database import SessionLocal
 from src.data import crud
 

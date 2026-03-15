@@ -7,10 +7,10 @@ from src.ui.ui_utils import open_add_modal
 from src.ui.ui_lol import render_lol_view
 from src.ui.ui_sc2 import render_sc2_view
 from src.config import BASE_DIR, SETTINGS_PATH
-from src.data_updater import update_sc2_data
-from src.sync_engine import SyncEngine
-from src.live_tracker import LiveTracker
-from src.sc2_live import SC2Live
+from src.sc2.sync import update_sc2_data
+from src.lol.sync import SyncEngine
+from src.lol.live import LiveTracker
+from src.sc2.live import SC2Live
 
 
 class AccountManagerApp(ctk.CTk):

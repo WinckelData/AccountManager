@@ -4,7 +4,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
-from src.api_clients import BlizzardClient
+from src.sc2.api_client import BlizzardClient
 from src.data.database import SessionLocal
 from src.data import crud
 
