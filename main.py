@@ -9,6 +9,8 @@ from src.ui.ui_sc2 import render_sc2_view
 from src.config import BASE_DIR, SETTINGS_PATH
 from src.data_updater import update_sc2_data
 from src.sync_engine import SyncEngine
+from src.live_tracker import LiveTracker
+from src.sc2_live import SC2Live
 
 
 class AccountManagerApp(ctk.CTk):
@@ -22,7 +24,28 @@ class AccountManagerApp(ctk.CTk):
         self.updating = {"LoL": False, "SC2": False}
         self.update_start_times = {"LoL": 0, "SC2": 0}
         self.settings = self.load_settings()
-        
+
+        # Live tracking
+        self._live_tracker = LiveTracker()
+        self._sc2_live = SC2Live()
+        if self.settings.get("lol_live_tracking", False):
+            self._live_tracker.start()
+        if self.settings.get("sc2_live_tracking", False):
+            self._sc2_live.start()
+
+        from src.data.database import engine, SessionLocal
+        from src.data.models import Base  # noqa: registers ORM models
+        from src.data import crud
+        Base.metadata.create_all(bind=engine)
+
+        # Clear stale live/post-game state from previous session
+        db = SessionLocal()
+        try:
+            crud.clear_all_live_states(db)
+            db.commit()
+        finally:
+            db.close()
+
         self.load_data()
 
         self.grid_rowconfigure(0, weight=1)
@@ -76,6 +99,7 @@ class AccountManagerApp(ctk.CTk):
         self.main_frame.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
 
         self.show_lol_view()
+        self._live_refresh_loop()
 
     # --- Helper Logic ---
     def load_image(self, rel_path, size):
@@ -162,6 +186,89 @@ class AccountManagerApp(ctk.CTk):
             self.lbl_status.configure(text=f"{self.current_game} Updating... ({time_str})", text_color="#d4a017")
             self.after(1000, self._update_timer)
 
+    def _get_live_state(self):
+        """Build a dict of live-relevant fields for diff comparison."""
+        state = {}
+        if self.current_game == "SC2":
+            for acc in self.sc2_data:
+                for p in acc.profiles:
+                    state[p.profile_id] = (p.is_in_game, p.last_game_result)
+        elif self.current_game == "LoL":
+            for p in self.lol_data:
+                state[p.puuid] = (p.is_in_game, p.last_game_result, p.last_game_lp_change)
+        return state
+
+    def _update_live_timers(self):
+        """Update only the timer labels in-place without rebuilding the view."""
+        import time as _time
+        # SC2 timers
+        for acc in self.sc2_data:
+            for prof in acc.profiles:
+                if not prof.is_in_game or not prof.current_game_start:
+                    continue
+                account_id = f"{acc.account_name}_{acc.account_folder_id or 0}"
+                widgets = self.sc2_row_widgets.get(account_id)
+                if not widgets:
+                    continue
+                timer_lbl = widgets.get('timer_lbl')
+                if not timer_lbl:
+                    continue
+                try:
+                    if not timer_lbl.winfo_exists():
+                        continue
+                    elapsed_s = int((_time.time() * 1000 - prof.current_game_start) / 1000)
+                    mins, secs = divmod(max(0, elapsed_s), 60)
+                    timer_lbl.configure(text=f"|  {mins}:{secs:02d}")
+                except Exception:
+                    pass
+        # LoL timers
+        for prof in self.lol_data:
+            if not prof.is_in_game or not prof.current_game_start:
+                continue
+            widgets = self.lol_row_widgets.get(prof.account_name)
+            if not widgets:
+                continue
+            timer_lbl = widgets.get('timer_lbl')
+            if not timer_lbl:
+                continue
+            try:
+                if not timer_lbl.winfo_exists():
+                    continue
+                elapsed_s = int((_time.time() * 1000 - prof.current_game_start) / 1000)
+                mins, secs = divmod(max(0, elapsed_s), 60)
+                timer_lbl.configure(text=f"|  {mins}:{secs:02d}")
+            except Exception:
+                pass
+
+    def _live_refresh_loop(self):
+        """Periodically refresh the active view when live tracking is enabled."""
+        try:
+            game = self.current_game
+            is_live = (
+                (game == "LoL" and self.settings.get("lol_live_tracking", False))
+                or (game == "SC2" and self.settings.get("sc2_live_tracking", False))
+            )
+            if is_live and not self.updating.get(game, False):
+                prev_state = getattr(self, '_prev_live_state', {})
+                self.load_data()
+                new_state = self._get_live_state()
+
+                if new_state != prev_state:
+                    # State changed — full re-render
+                    if game == "LoL":
+                        self.show_lol_view()
+                    else:
+                        self.show_sc2_view()
+                elif any(v[0] for v in new_state.values()):
+                    # No state change but live accounts exist — update timers only
+                    self._update_live_timers()
+                # else: no live accounts, skip
+
+                self._prev_live_state = new_state
+        except Exception as e:
+            print(f"[LiveRefresh] Error: {e}")
+        self.after(10_000, self._live_refresh_loop)
+
     # --- View Switchers ---
     def show_lol_view(self):
         self.current_game = "LoL"
@@ -185,9 +292,12 @@ class AccountManagerApp(ctk.CTk):
             self.main_frame,
             self.lol_data,
             self.copy_to_clipboard,
-            lambda: open_add_modal(self),  # Passing 'self' gives the utility access to app state
+            lambda: open_add_modal(self),
             self.img_lol_head,
-            self.lol_row_widgets
+            self.lol_row_widgets,
+            delete_callback=self.delete_lol_account,
+            live_tracking_enabled=self.settings.get("lol_live_tracking", False),
+            live_tracking_toggle_cb=self._toggle_lol_live_tracking,
         )
         
         if hasattr(self, 'update_status') and "LoL" in self.update_status:
@@ -221,7 +331,9 @@ class AccountManagerApp(ctk.CTk):
             self.copy_to_clipboard,
             lambda: open_add_modal(self),
             self.img_sc2_head,
-            self.sc2_row_widgets
+            self.sc2_row_widgets,
+            live_tracking_enabled=self.settings.get("sc2_live_tracking", False),
+            live_tracking_toggle_cb=self._toggle_sc2_live_tracking,
         )
         
         if hasattr(self, 'update_status') and "SC2" in self.update_status:
@@ -231,7 +343,38 @@ class AccountManagerApp(ctk.CTk):
                     display_name = w.get('display_name', acc_id)
                     self._apply_row_style(w['card'], w['name_lbl'], display_name, state['status'], state['has_changes'])
 
+    # --- Live Tracking Toggles ---
+    def _toggle_lol_live_tracking(self, enabled: bool):
+        self.settings["lol_live_tracking"] = enabled
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(self.settings, f)
+        if enabled:
+            self._live_tracker.start()
+        else:
+            self._live_tracker.stop()
+
+    def _toggle_sc2_live_tracking(self, enabled: bool):
+        self.settings["sc2_live_tracking"] = enabled
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(self.settings, f)
+        if enabled:
+            self._sc2_live.start()
+        else:
+            self._sc2_live.stop()
+
     # --- Actions ---
+    def delete_lol_account(self, account_id: int):
+        from src.data.database import SessionLocal
+        from src.data import crud
+        db = SessionLocal()
+        try:
+            crud.delete_account(db, account_id)
+            db.commit()
+        finally:
+            db.close()
+        self.load_data()
+        self.show_lol_view()
+
     def copy_to_clipboard(self, text):
         if not text:
             self.lbl_status.configure(text="No login saved!", text_color="orange")
