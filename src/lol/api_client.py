@@ -150,3 +150,90 @@ class RiotClient:
     def get_champion_masteries(self, platform, puuid):
         url = f"{self.base_url_platform.format(platform=platform)}/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}"
         return self._request(url)
+
+    def _probe(self, url, ok_statuses=(200,)):
+        """Single raw GET using primary key, 5s timeout, no retries.
+        Returns (status, ok, message, latency_ms).
+        """
+        headers = {"X-Riot-Token": self.keys[0].key}
+        try:
+            start = time.time()
+            resp = requests.get(url, headers=headers, timeout=5)
+            latency = int((time.time() - start) * 1000)
+            ok = resp.status_code in ok_statuses
+            msg = "OK" if ok else resp.reason or str(resp.status_code)
+            return (resp.status_code, ok, msg, latency)
+        except requests.exceptions.RequestException as e:
+            return (None, False, str(e), 0)
+
+    def health_check(self, test_data):
+        """Run diagnostic probes against Riot LoL API endpoints.
+
+        test_data: dict with keys:
+            puuid, game_name, tag_line, regional, platform,
+            match_id (optional)
+        """
+        from src.health import EndpointResult, HealthCheckReport
+
+        results = []
+        puuid = test_data["puuid"]
+        game_name = test_data["game_name"]
+        tag_line = test_data["tag_line"]
+        regional = test_data["regional"]
+        platform = test_data["platform"]
+        match_id = test_data.get("match_id")
+
+        base_r = self.base_url_regional.format(region=regional)
+        base_p = self.base_url_platform.format(platform=platform)
+
+        # 1. account/v1
+        url = f"{base_r}/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}"
+        status, ok, msg, lat = self._probe(url)
+        results.append(EndpointResult("account/v1", regional, status, ok, msg, lat))
+
+        # 2. summoner/v4
+        url = f"{base_p}/lol/summoner/v4/summoners/by-puuid/{puuid}"
+        status, ok, msg, lat = self._probe(url)
+        results.append(EndpointResult("summoner/v4", platform, status, ok, msg, lat))
+
+        # 3. league/v4
+        url = f"{base_p}/lol/league/v4/entries/by-puuid/{puuid}"
+        status, ok, msg, lat = self._probe(url)
+        results.append(EndpointResult("league/v4", platform, status, ok, msg, lat))
+
+        # 4. match/v5/ids
+        url = f"{base_r}/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count=1"
+        status, ok, msg, lat = self._probe(url)
+        results.append(EndpointResult("match/v5/ids", regional, status, ok, msg, lat))
+
+        # 5. spectator/v5 (404 = OK, means not in game)
+        url = f"{base_p}/lol/spectator/v5/active-games/by-summoner/{puuid}"
+        status, ok, msg, lat = self._probe(url, ok_statuses=(200, 404))
+        results.append(EndpointResult("spectator/v5", platform, status, ok, msg, lat))
+
+        # 6. mastery/v4
+        url = f"{base_p}/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}"
+        status, ok, msg, lat = self._probe(url)
+        results.append(EndpointResult("mastery/v4", platform, status, ok, msg, lat))
+
+        # 7. match/v5/detail
+        if match_id:
+            url = f"{base_r}/lol/match/v5/matches/{match_id}"
+            status, ok, msg, lat = self._probe(url)
+            results.append(EndpointResult("match/v5/detail", regional, status, ok, msg, lat))
+        else:
+            results.append(EndpointResult(
+                "match/v5/detail", regional, None, False, "Skipped — no match_id",
+            ))
+
+        # 8. match/v5/timeline
+        if match_id:
+            url = f"{base_r}/lol/match/v5/matches/{match_id}/timeline"
+            status, ok, msg, lat = self._probe(url)
+            results.append(EndpointResult("match/v5/timeline", regional, status, ok, msg, lat))
+        else:
+            results.append(EndpointResult(
+                "match/v5/timeline", regional, None, False, "Skipped — no match_id",
+            ))
+
+        return HealthCheckReport(service="Riot", results=results)

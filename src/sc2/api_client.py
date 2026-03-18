@@ -122,9 +122,16 @@ class BlizzardClient:
         return self._request_nullable(url)
 
     def get_current_season(self, region_id):
+        """Return full season dict with seasonId, startDate, endDate (epoch seconds)."""
         url = f"https://{self._get_region_name(region_id)}.api.blizzard.com/sc2/ladder/season/{region_id}"
         data = self._request(url)
-        return data.get("seasonId") if data else None
+        if not data:
+            return None
+        return {
+            "seasonId": data.get("seasonId"),
+            "startDate": data.get("startDate"),
+            "endDate": data.get("endDate"),
+        }
 
     def get_profile_metadata(self, region_id, realm_id, profile_id):
         url = f"https://{self._get_region_name(region_id)}.api.blizzard.com/sc2/metadata/profile/{region_id}/{realm_id}/{profile_id}"
@@ -147,6 +154,113 @@ class BlizzardClient:
         """Grandmaster leaderboard for a region."""
         url = f"https://{self._get_region_name(region_id)}.api.blizzard.com/sc2/ladder/grandmaster/{region_id}"
         return self._request(url)
+
+    def _probe(self, url):
+        """Single raw GET with 10s timeout, no retries, no rate-limit wait.
+        Returns (status, ok, message, latency_ms).
+        """
+        if not self.access_token:
+            return (None, False, "No access token", 0)
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        try:
+            start = time.time()
+            resp = requests.get(url, headers=headers, timeout=10)
+            latency = int((time.time() - start) * 1000)
+            ok = resp.status_code == 200
+            msg = "OK" if ok else resp.reason or str(resp.status_code)
+            return (resp.status_code, ok, msg, latency)
+        except requests.exceptions.RequestException as e:
+            return (None, False, str(e), 0)
+
+    def health_check(self, test_profiles=None):
+        """Run diagnostic probes against Blizzard SC2 API endpoints.
+
+        test_profiles: dict mapping region_id -> (realm_id, profile_id)
+            e.g. {1: (1, 12345), 2: (1, 67890)}
+        """
+        from src.health import EndpointResult, HealthCheckReport
+
+        if test_profiles is None:
+            test_profiles = {}
+
+        results = []
+        region_names = {1: "NA", 2: "EU", 3: "KR"}
+
+        # 1. OAuth token probe
+        try:
+            start = time.time()
+            resp = requests.post(
+                "https://oauth.battle.net/token",
+                data={"grant_type": "client_credentials"},
+                auth=(self.client_id, self.client_secret),
+                timeout=5,
+            )
+            latency = int((time.time() - start) * 1000)
+            ok = resp.status_code == 200
+            results.append(EndpointResult(
+                endpoint="oauth/token",
+                region="--",
+                status=resp.status_code,
+                ok=ok,
+                message="OK" if ok else resp.reason or str(resp.status_code),
+                latency_ms=latency,
+            ))
+            if ok:
+                self.access_token = resp.json().get("access_token")
+        except requests.exceptions.RequestException as e:
+            results.append(EndpointResult(
+                endpoint="oauth/token", region="--",
+                status=None, ok=False, message=str(e),
+            ))
+
+        if not self.access_token:
+            results.append(EndpointResult(
+                endpoint="(remaining)", region="--",
+                status=None, ok=False, message="Skipped — no token",
+            ))
+            return HealthCheckReport(service="Blizzard", results=results)
+
+        # 2. Per-region probes
+        for region_id in (1, 2, 3):
+            rname = region_names[region_id]
+            host = self._get_region_name(region_id)
+
+            # current_season
+            url = f"https://{host}.api.blizzard.com/sc2/ladder/season/{region_id}"
+            status, ok, msg, lat = self._probe(url)
+            results.append(EndpointResult("current_season", rname, status, ok, msg, lat))
+
+            # grandmaster_ladder
+            url = f"https://{host}.api.blizzard.com/sc2/ladder/grandmaster/{region_id}"
+            status, ok, msg, lat = self._probe(url)
+            results.append(EndpointResult("grandmaster_ladder", rname, status, ok, msg, lat))
+
+            # Profile-dependent endpoints
+            if region_id in test_profiles:
+                realm_id, profile_id = test_profiles[region_id]
+
+                url = f"https://{host}.api.blizzard.com/sc2/profile/{region_id}/{realm_id}/{profile_id}"
+                status, ok, msg, lat = self._probe(url)
+                results.append(EndpointResult("sc2_profile", rname, status, ok, msg, lat))
+
+                url = f"https://{host}.api.blizzard.com/sc2/metadata/profile/{region_id}/{realm_id}/{profile_id}"
+                status, ok, msg, lat = self._probe(url)
+                results.append(EndpointResult("profile_metadata", rname, status, ok, msg, lat))
+
+                url = f"https://{host}.api.blizzard.com/sc2/profile/{region_id}/{realm_id}/{profile_id}/ladder/summary"
+                status, ok, msg, lat = self._probe(url)
+                results.append(EndpointResult("ladder_summary", rname, status, ok, msg, lat))
+
+                url = f"https://{host}.api.blizzard.com/sc2/legacy/profile/{region_id}/{realm_id}/{profile_id}/matches"
+                status, ok, msg, lat = self._probe(url)
+                results.append(EndpointResult("match_history", rname, status, ok, msg, lat))
+
+                results.append(EndpointResult(
+                    "ladder_details", rname, None, False,
+                    "Skipped — needs ladder_id from summary",
+                ))
+
+        return HealthCheckReport(service="Blizzard", results=results)
 
     def _get_region_name(self, region_id):
         regions = {1: "us", 2: "eu", 3: "kr"}
