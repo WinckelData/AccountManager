@@ -12,6 +12,9 @@ class RankDTO:
     wins: int
     losses: int
     lp_delta: int = 0  # LP change vs oldest recent snapshot (positive = gain)
+    decay_bank_days: Optional[int] = None   # banked days remaining (None = not Diamond+)
+    decay_active: bool = False               # True if bank is 0 and losing LP
+    decay_lp_per_day: Optional[int] = None   # 50 for Diamond, 75 for Apex
 
 @dataclass
 class MasteryDTO:
@@ -40,6 +43,7 @@ class LoLProfileDTO:
     last_game_result: Optional[str] = None
     last_game_queue_id: Optional[int] = None
     last_game_lp_change: Optional[int] = None
+    last_game_ended_at: Optional[int] = None  # epoch seconds
 
 
 # --- StarCraft II DTOs ---
@@ -50,6 +54,13 @@ class SC2RankDTO:
     mmr: int
     mmr_delta: int = 0          # MMR change vs oldest recent snapshot
     is_grandmaster: bool = False
+    gm_demotion_days: Optional[int] = None            # days until game count drops below 30 (without games)
+    gm_games_to_safety: Optional[int] = None          # games needed today to extend demotion by 1+ day
+    gm_mmr_threshold: Optional[int] = None           # lowest GM MMR on server (Masters only)
+    mmr_above_gm: Optional[int] = None               # mmr - gm_threshold (Masters only)
+    gm_rank: Optional[int] = None                    # actual GM ladder rank (GM accounts only)
+    gm_projected_rank: Optional[int] = None          # projected rank if promoted (Masters above threshold)
+    gm_games_played_3weeks: Optional[int] = None     # games in last 21 days (Masters above threshold)
 
 @dataclass
 class SC2ProfileDTO:
@@ -67,6 +78,10 @@ class SC2ProfileDTO:
     current_game_start: Optional[int] = None  # epoch ms
     last_game_result: Optional[str] = None    # Victory / Defeat / Tie
     last_game_opponent: Optional[str] = None
+    last_game_ended_at: Optional[int] = None  # epoch seconds
+    last_game_mmr_change: Optional[int] = None  # MMR delta from post-game re-fetch
+    last_game_mmr_race: Optional[str] = None  # race the MMR delta applies to
+    last_game_gm_rank_change: Optional[int] = None  # GM rank delta from post-game re-fetch
 
 @dataclass
 class SC2AccountDTO:

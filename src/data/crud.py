@@ -5,6 +5,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, delete, update
 from sqlalchemy.dialects.sqlite import insert
 
+from sqlalchemy import literal_column
+
 from src.data.models import (
     Account,
     LoLProfile,
@@ -18,6 +20,7 @@ from src.data.models import (
     SC2RankSnapshot,
     SC2RawData,
     SC2Match,
+    SC2GMThreshold,
 )
 
 
@@ -158,12 +161,13 @@ def upsert_lol_ranks(
     lp: int,
     wins: int,
     losses: int,
-) -> None:
+) -> bool:
     """
     True upsert for LoL rank using the unique constraint (profile_id, queue_type).
-    Records a snapshot if the rank data changed.
+    Records a snapshot if the rank data changed. Returns True if data changed.
     """
     now = int(time.time())
+    decay_tiers = {"DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"}
 
     # Fetch current rank to detect change before upserting
     existing = db.execute(
@@ -173,6 +177,19 @@ def upsert_lol_ranks(
         )
     ).scalar_one_or_none()
 
+    # Determine decay_start value
+    new_is_decay = tier.upper() in decay_tiers
+    old_is_decay = existing is not None and existing.tier.upper() in decay_tiers
+    if new_is_decay and not old_is_decay:
+        # Fresh promotion into Diamond+ → set decay_start
+        decay_start = now
+    elif new_is_decay and old_is_decay:
+        # Already Diamond+ → preserve existing decay_start
+        decay_start = existing.decay_start if existing.decay_start else now
+    else:
+        # Below Diamond → no decay
+        decay_start = None
+
     stmt = insert(LoLRank).values(
         profile_id=profile_id,
         queue_type=queue_type,
@@ -181,6 +198,7 @@ def upsert_lol_ranks(
         lp=lp,
         wins=wins,
         losses=losses,
+        decay_start=decay_start,
         updated_at=now,
     )
     upsert_stmt = stmt.on_conflict_do_update(
@@ -191,6 +209,7 @@ def upsert_lol_ranks(
             lp=stmt.excluded.lp,
             wins=stmt.excluded.wins,
             losses=stmt.excluded.losses,
+            decay_start=decay_start,
             updated_at=now,
         )
     )
@@ -218,6 +237,7 @@ def upsert_lol_ranks(
         ))
 
     db.flush()
+    return changed
 
 
 def upsert_lol_masteries(
@@ -357,6 +377,11 @@ def set_lol_in_game_status(
         values["last_game_queue_id"] = last_game_queue_id
     if last_game_lp_change is not None or clear_result:
         values["last_game_lp_change"] = last_game_lp_change
+    # Record game end timestamp when transitioning to not-in-game with a result
+    if not is_in_game and last_game_result is not None:
+        values["last_game_ended_at"] = int(time.time())
+    if clear_result:
+        values["last_game_ended_at"] = None
 
     db.execute(
         update(LoLProfile)
@@ -390,6 +415,7 @@ def clear_all_live_states(db: Session) -> None:
             last_game_result=None,
             last_game_queue_id=None,
             last_game_lp_change=None,
+            last_game_ended_at=None,
         )
     )
     db.execute(
@@ -400,6 +426,10 @@ def clear_all_live_states(db: Session) -> None:
             current_game_start=None,
             last_game_result=None,
             last_game_opponent=None,
+            last_game_ended_at=None,
+            last_game_mmr_change=None,
+            last_game_mmr_race=None,
+            last_game_gm_rank_change=None,
         )
     )
     db.flush()
@@ -451,10 +481,10 @@ def upsert_sc2_ranks(
     mmr: int,
     league: Optional[str],
     is_grandmaster: bool = False,
-) -> None:
+) -> bool:
     """
     True upsert for SC2 rank using the unique constraint.
-    Records a snapshot if the rank data changed.
+    Records a snapshot if the rank data changed. Returns True if data changed.
     """
     now = int(time.time())
 
@@ -501,6 +531,7 @@ def upsert_sc2_ranks(
         ))
 
     db.flush()
+    return changed
 
 
 def upsert_sc2_raw_data(
@@ -542,6 +573,9 @@ def set_sc2_in_game_status(
     current_game_start: Optional[int] = None,
     last_game_result: Optional[str] = None,
     last_game_opponent: Optional[str] = None,
+    last_game_mmr_change: Optional[int] = None,
+    last_game_mmr_race: Optional[str] = None,
+    last_game_gm_rank_change: Optional[int] = None,
     clear_result: bool = False,
 ) -> None:
     """Update the in-game status for an SC2 profile.
@@ -559,6 +593,20 @@ def set_sc2_in_game_status(
         values["last_game_result"] = last_game_result
     if last_game_opponent is not None or clear_result:
         values["last_game_opponent"] = last_game_opponent
+    if last_game_mmr_change is not None:
+        values["last_game_mmr_change"] = last_game_mmr_change
+    if last_game_mmr_race is not None:
+        values["last_game_mmr_race"] = last_game_mmr_race
+    if last_game_gm_rank_change is not None:
+        values["last_game_gm_rank_change"] = last_game_gm_rank_change
+    # Record game end timestamp when transitioning to not-in-game with a result
+    if not is_in_game and last_game_result is not None:
+        values["last_game_ended_at"] = int(time.time())
+    if clear_result:
+        values["last_game_ended_at"] = None
+        values["last_game_mmr_change"] = None
+        values["last_game_mmr_race"] = None
+        values["last_game_gm_rank_change"] = None
 
     db.execute(
         update(SC2Profile)
@@ -689,3 +737,122 @@ def get_sc2_rank_snapshots(
         .limit(limit)
     )
     return list(db.execute(stmt).scalars().all())
+
+
+# --- Decay / GM Threshold Queries ---
+
+def get_lol_ranked_matches_since(
+    db: Session,
+    profile_id: int,
+    queue_id: int,
+    since_epoch_ms: int,
+) -> List[LoLMatch]:
+    """Fetch LoL matches for a profile filtered by queue ID and recency."""
+    stmt = (
+        select(LoLMatch)
+        .join(LoLMatchParticipant, LoLMatch.match_id == LoLMatchParticipant.match_id)
+        .where(
+            LoLMatchParticipant.profile_id == profile_id,
+            LoLMatch.game_creation >= since_epoch_ms,
+            literal_column("json_extract(lol_matches.raw_details, '$.info.queueId')") == queue_id,
+        )
+        .order_by(LoLMatch.game_creation.asc())
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def get_sc2_matches_since(
+    db: Session,
+    profile_id: int,
+    since_epoch: int,
+) -> List[SC2Match]:
+    """Fetch SC2 matches for a profile since a given epoch timestamp."""
+    stmt = (
+        select(SC2Match)
+        .where(
+            SC2Match.profile_id == profile_id,
+            SC2Match.date >= since_epoch,
+        )
+        .order_by(SC2Match.date.asc())
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def upsert_sc2_gm_threshold(
+    db: Session,
+    region_id: int,
+    min_gm_mmr: int,
+    ladder_mmrs: Optional[str] = None,
+    season_id: Optional[int] = None,
+    season_start: Optional[int] = None,
+    season_end: Optional[int] = None,
+) -> None:
+    """Store/update the lowest GM MMR, ladder MMR list, and season data for a region."""
+    now = int(time.time())
+    stmt = insert(SC2GMThreshold).values(
+        region_id=region_id,
+        min_gm_mmr=min_gm_mmr,
+        ladder_mmrs=ladder_mmrs,
+        season_id=season_id,
+        season_start=season_start,
+        season_end=season_end,
+        updated_at=now,
+    )
+    update_set = dict(min_gm_mmr=min_gm_mmr, ladder_mmrs=ladder_mmrs, updated_at=now)
+    if season_id is not None:
+        update_set["season_id"] = season_id
+    if season_start is not None:
+        update_set["season_start"] = season_start
+    if season_end is not None:
+        update_set["season_end"] = season_end
+    upsert_stmt = stmt.on_conflict_do_update(
+        index_elements=["region_id"],
+        set_=update_set,
+    )
+    db.execute(upsert_stmt)
+
+
+def get_sc2_gm_threshold(db: Session, region_id: int) -> Optional[int]:
+    """Return the lowest GM MMR for a region, or None if not yet populated."""
+    row = db.execute(
+        select(SC2GMThreshold.min_gm_mmr).where(SC2GMThreshold.region_id == region_id)
+    ).scalar_one_or_none()
+    return row
+
+
+def get_sc2_gm_ladder(db: Session, region_id: int) -> Optional[tuple]:
+    """Return (min_mmr, List[int]) for a region's GM ladder, or None if not populated."""
+    import json
+    row = db.execute(
+        select(SC2GMThreshold.min_gm_mmr, SC2GMThreshold.ladder_mmrs)
+        .where(SC2GMThreshold.region_id == region_id)
+    ).one_or_none()
+    if row is None:
+        return None
+    min_mmr, ladder_json = row
+    mmrs = json.loads(ladder_json) if ladder_json else []
+    return (min_mmr, mmrs)
+
+
+def get_latest_sc2_match_date(db: Session, profile_id: int) -> Optional[int]:
+    """Return the most recent match date (epoch) for a profile, or None."""
+    return db.execute(
+        select(SC2Match.date)
+        .where(SC2Match.profile_id == profile_id)
+        .order_by(SC2Match.date.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def get_sc2_season_info(db: Session, region_id: int) -> Optional[dict]:
+    """Return season metadata for a region, or None if not populated."""
+    row = db.execute(
+        select(
+            SC2GMThreshold.season_id,
+            SC2GMThreshold.season_start,
+            SC2GMThreshold.season_end,
+        ).where(SC2GMThreshold.region_id == region_id)
+    ).one_or_none()
+    if row is None or row[0] is None:
+        return None
+    return {"season_id": row[0], "season_start": row[1], "season_end": row[2]}

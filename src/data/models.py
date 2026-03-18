@@ -1,5 +1,5 @@
 import time
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, JSON, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, Boolean, ForeignKey, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -45,6 +45,7 @@ class LoLProfile(Base):
     last_game_result = Column(String, nullable=True)
     last_game_queue_id = Column(Integer, nullable=True)
     last_game_lp_change = Column(Integer, nullable=True)
+    last_game_ended_at = Column(Integer, nullable=True)  # epoch seconds when game ended
     created_at = Column(Integer, default=lambda: int(time.time()))
     updated_at = Column(Integer, default=lambda: int(time.time()), onupdate=lambda: int(time.time()))
 
@@ -67,6 +68,7 @@ class LoLRank(Base):
     lp = Column(Integer, default=0)
     wins = Column(Integer, default=0)
     losses = Column(Integer, default=0)
+    decay_start = Column(Integer, nullable=True)  # epoch seconds: when last promoted into Diamond+
     updated_at = Column(Integer, default=lambda: int(time.time()), onupdate=lambda: int(time.time()))
 
     profile = relationship("LoLProfile", back_populates="ranks")
@@ -146,6 +148,10 @@ class SC2Profile(Base):
     current_game_start = Column(Integer, nullable=True)  # epoch ms
     last_game_result = Column(String, nullable=True)     # Victory / Defeat / Tie
     last_game_opponent = Column(String, nullable=True)
+    last_game_ended_at = Column(Integer, nullable=True)  # epoch seconds when game ended
+    last_game_mmr_change = Column(Integer, nullable=True)  # MMR delta from post-game re-fetch
+    last_game_mmr_race = Column(String, nullable=True)  # race the MMR delta applies to
+    last_game_gm_rank_change = Column(Integer, nullable=True)  # GM rank delta from post-game re-fetch
     created_at = Column(Integer, default=lambda: int(time.time()))
     updated_at = Column(Integer, default=lambda: int(time.time()), onupdate=lambda: int(time.time()))
 
@@ -231,3 +237,15 @@ class SC2RankSnapshot(Base):
     mmr = Column(Integer, default=0)
     league = Column(String, nullable=True)
     recorded_at = Column(Integer, default=lambda: int(time.time()), nullable=False)
+
+
+class SC2GMThreshold(Base):
+    __tablename__ = "sc2_gm_thresholds"
+
+    region_id = Column(Integer, primary_key=True)  # 1=NA, 2=EU, 3=KR
+    min_gm_mmr = Column(Integer, nullable=False, default=0)
+    ladder_mmrs = Column(Text, nullable=True)  # JSON array of all GM MMRs sorted descending
+    season_id = Column(Integer, nullable=True)
+    season_start = Column(Integer, nullable=True)  # epoch seconds
+    season_end = Column(Integer, nullable=True)    # epoch seconds
+    updated_at = Column(Integer, default=lambda: int(time.time()), onupdate=lambda: int(time.time()))
