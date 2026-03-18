@@ -194,7 +194,7 @@ class SyncEngine:
             for r in ranks_data:
                 queue_type = r.get("queueType")
                 if queue_type in ["RANKED_SOLO_5x5", "RANKED_FLEX_SR"]:
-                    crud.upsert_lol_ranks(
+                    rank_changed = crud.upsert_lol_ranks(
                         db=db,
                         profile_id=profile_id,
                         queue_type=queue_type,
@@ -204,8 +204,9 @@ class SyncEngine:
                         wins=r.get("wins", 0),
                         losses=r.get("losses", 0),
                     )
+                    if rank_changed:
+                        has_changes = True
             db.commit()
-            has_changes = True
 
         # 4. Check in-game status (Spectator-V5)
         print("   - Checking in-game status...")

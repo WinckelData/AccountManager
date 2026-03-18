@@ -12,3 +12,6 @@ ORM_DB_PATH = DATA_DIR / "app_orm.db"
 
 # Ensure data directories exist
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+NUM_WORKERS_SC2 = 9
+POST_GAME_PIN_TIMEOUT = 300  # seconds before post-game pin auto-dismisses

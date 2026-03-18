@@ -196,8 +196,8 @@ class LiveTracker:
             old_lp = _absolute_lp(old_rank.tier, old_rank.rank, old_rank.lp) if old_rank else None
 
             # 2. Wait for Riot API match data to become available
-            print(f"[LiveTracker] Waiting 90s for match data ({name_tag})...")
-            time.sleep(90)
+            print(f"[LiveTracker] Waiting 5s for match data ({name_tag})...")
+            time.sleep(5)
 
             # 3. Re-fetch rank from League-V4 and upsert
             ranks_data = self.riot.get_league_entries(platform, puuid)
