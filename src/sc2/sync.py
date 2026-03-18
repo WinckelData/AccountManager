@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from src.sc2.api_client import BlizzardClient
 from src.data.database import SessionLocal
 from src.data import crud
+from src.config import NUM_WORKERS_SC2
 
 _print_lock = threading.Lock()
 
@@ -31,48 +32,6 @@ def get_current_patch():
     """Fetches the current live League of Legends patch from Data Dragon."""
     from src.static_data import StaticDataManager
     return StaticDataManager().get_latest_version() or "Unknown"
-
-
-def calculate_decay_bank(puuid, match_history, queue_type):
-    """
-    Computes the decayed-bank balance for a Diamond+ account.
-
-    Rules (simulated over the last 30 days):
-      - Bank starts at 10 days.
-      - Each ranked game played adds 1 banked day (cap 14).
-      - Each calendar day with no ranked game subtracts 1 banked day (floor 0).
-
-    Returns the estimated banked days remaining (int).
-    """
-    if not match_history:
-        return 0
-
-    valid_match_times = []
-    for m in match_history:
-        info = m.get("info", {})
-        if info.get("queueId") == queue_type:
-            valid_match_times.append(info.get("gameCreation", 0) / 1000)  # ms -> s
-
-    valid_match_times.sort()
-
-    now = time.time()
-    thirty_days_ago = now - (30 * 24 * 3600)
-    recent = [t for t in valid_match_times if t > thirty_days_ago]
-
-    bank = 10
-    MAX_BANK = 14
-
-    for day_offset in range(30):
-        day_start = thirty_days_ago + (day_offset * 86400)
-        day_end = day_start + 86400
-        games_today = sum(1 for t in recent if day_start <= t < day_end)
-
-        if games_today > 0:
-            bank = min(MAX_BANK, bank + games_today)
-        else:
-            bank = max(0, bank - 1)
-
-    return bank
 
 
 def _sync_single_sc2(account_dict, blizz, season_cache, gm_cache, progress_callback, total_accounts):
@@ -144,7 +103,7 @@ def _sync_single_sc2(account_dict, blizz, season_cache, gm_cache, progress_callb
                             mmr = ladder_team.get("mmr", 0)
                             break
 
-                    crud.upsert_sc2_ranks(
+                    rank_changed = crud.upsert_sc2_ranks(
                         db=db,
                         profile_id=profile_db_id,
                         season=current_season,
@@ -154,7 +113,41 @@ def _sync_single_sc2(account_dict, blizz, season_cache, gm_cache, progress_callb
                         league=league,
                         is_grandmaster=is_gm,
                     )
-                    has_changes = True
+                    if rank_changed:
+                        has_changes = True
+
+                # showCaseEntries is capped at 3 — fetch any extra 1v1 ladders from allLadderMemberships
+                processed_ladder_ids = {entry.get("ladderId") for entry in showcase
+                                        if entry.get("team", {}).get("localizedGameMode") == "1v1"}
+                for membership in summary.get("allLadderMemberships", []):
+                    if not membership.get("localizedGameMode", "").startswith("1v1"):
+                        continue
+                    m_ladder_id = membership.get("ladderId")
+                    if m_ladder_id in processed_ladder_ids:
+                        continue
+
+                    ladder_details = blizz.get_ladder_details(reg, rlm, pid, m_ladder_id)
+                    for ladder_team in ladder_details.get("ladderTeams", []):
+                        team_members = ladder_team.get("teamMembers", [])
+                        if any(str(m.get("id")) == str(pid) for m in team_members):
+                            mmr = ladder_team.get("mmr", 0)
+                            race = team_members[0].get("favoriteRace", "").lower()
+                            if race not in ("terran", "zerg", "protoss", "random"):
+                                break
+                            league = membership.get("localizedGameMode", "").split(" ", 1)[-1].capitalize()
+                            rank_changed = crud.upsert_sc2_ranks(
+                                db=db,
+                                profile_id=profile_db_id,
+                                season=current_season,
+                                race=race,
+                                queue_type="1v1",
+                                mmr=mmr,
+                                league=league,
+                                is_grandmaster=is_gm,
+                            )
+                            if rank_changed:
+                                has_changes = True
+                            break
 
             # Fetch live match history (last 25 matches)
             print(f"  -> Fetching match history for {ign}...", file=buf)
@@ -217,16 +210,38 @@ def update_sc2_data(progress_callback=None):
             for profile in acc.sc2_profiles:
                 regions_seen.add(profile.region_id)
 
-        for reg in regions_seen:
-            season_cache[reg] = blizz.get_current_season(reg)
+        import json
+
+        def _fetch_region_data(reg):
+            """Fetch season + GM ladder for one region in parallel."""
             reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(reg, "Unknown")
-            print(f"  -> Fetching GM ladder for region {reg_name}...")
+            print(f"  -> Fetching season + GM ladder for region {reg_name}...")
+            season_data = blizz.get_current_season(reg)
+            season_id = season_data.get("seasonId") if season_data else None
             gm_data = blizz.get_grandmaster_ladder(reg)
             gm_ids = set()
+            gm_mmrs = []
             for team in gm_data.get("ladderTeams", []):
+                mmr_val = team.get("mmr", 0)
+                if mmr_val > 0:
+                    gm_mmrs.append(mmr_val)
                 for member in team.get("teamMembers", []):
                     gm_ids.add(str(member.get("id", "")))
-            gm_cache[reg] = gm_ids
+            return reg, season_id, gm_ids, gm_mmrs, season_data
+
+        with ThreadPoolExecutor(max_workers=len(regions_seen)) as region_pool:
+            for reg, season_id, gm_ids, gm_mmrs, season_data in region_pool.map(_fetch_region_data, regions_seen):
+                season_cache[reg] = season_id
+                gm_cache[reg] = gm_ids
+                if gm_mmrs:
+                    sorted_mmrs = sorted(gm_mmrs, reverse=True)
+                    s_start = season_data.get("startDate") if season_data else None
+                    s_end = season_data.get("endDate") if season_data else None
+                    crud.upsert_sc2_gm_threshold(
+                        db, reg, min(gm_mmrs), json.dumps(sorted_mmrs),
+                        season_id=season_id, season_start=s_start, season_end=s_end,
+                    )
+        db.commit()
 
         # Build account dicts (eager-load to avoid DetachedInstanceError in workers)
         account_dicts = []
@@ -266,8 +281,8 @@ def update_sc2_data(progress_callback=None):
                     cur = completed[0]
             progress_callback(account_id_str, status, has_changes, cur, total_accounts)
 
-    # Parallel sync: up to 8 workers (Blizzard limits are 100 req/s, each account ~10-15 calls)
-    num_workers = min(8, total_accounts)
+    # Parallel sync: up to NUM_WORKERS_SC2 workers (Blizzard limits are 100 req/s, each account ~10-15 calls)
+    num_workers = min(NUM_WORKERS_SC2, total_accounts)
     print(f"[SC2 Sync] {total_accounts} accounts, {num_workers} worker(s)\n" + "=" * 60)
 
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
