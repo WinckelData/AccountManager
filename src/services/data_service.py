@@ -15,46 +15,154 @@ from src.schemas import (
 )
 from src.static_data import StaticDataManager
 
-def calculate_decay_bank(puuid, match_history, queue_type):
+_DECAY_TIERS = {"DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"}
+_APEX_TIERS = {"MASTER", "GRANDMASTER", "CHALLENGER"}
+_QUEUE_ID_MAP = {"RANKED_SOLO_5x5": 420, "RANKED_FLEX_SR": 440}
+
+
+def _compute_lol_decay(
+    db: Session, profile_id: int, tier: str, queue_type: str, decay_start: Optional[int]
+) -> dict:
+    """Compute decay bank for a Diamond+ LoL rank.
+
+    Uses the official rules from:
+    https://support-leagueoflegends.riotgames.com/hc/en-us/articles/4405783687443
+
+    Returns dict with bank_days/active/lp_per_day (all None if below Diamond).
     """
-    Computes the decayed-bank balance for a Diamond+ account.
+    tier_upper = tier.upper()
+    if tier_upper not in _DECAY_TIERS:
+        return {"bank_days": None, "active": False, "lp_per_day": None}
 
-    Rules (simulated over the last 30 days):
-      - Bank starts at 10 days.
-      - Each ranked game played adds 1 banked day (cap 14).
-      - Each calendar day with no ranked game subtracts 1 banked day (floor 0).
-
-    Returns the estimated banked days remaining (int).
-    """
-    if not match_history:
-        return 0
-
-    valid_match_times = []
-    for m in match_history:
-        info = m.get("info", {})
-        if info.get("queueId") == queue_type:
-            valid_match_times.append(info.get("gameCreation", 0) / 1000)
-
-    valid_match_times.sort()
+    is_apex = tier_upper in _APEX_TIERS
+    initial_bank = 14 if is_apex else 28
+    days_per_game = 1 if is_apex else 7
+    max_bank = 14 if is_apex else 28
+    lp_per_day = 75 if is_apex else 50
 
     now = time.time()
-    thirty_days_ago = now - (30 * 24 * 3600)
-    recent = [t for t in valid_match_times if t > thirty_days_ago]
 
-    bank = 10
-    MAX_BANK = 14
+    # Determine simulation window start
+    if decay_start:
+        window_start = max(decay_start, now - max_bank * 86400)
+    else:
+        # Fallback: no decay_start recorded (pre-existing data) — assume full window
+        window_start = now - max_bank * 86400
 
-    for day_offset in range(30):
-        day_start = thirty_days_ago + (day_offset * 86400)
+    queue_id = _QUEUE_ID_MAP.get(queue_type, 420)
+    since_ms = int(window_start * 1000)
+    matches = crud.get_lol_ranked_matches_since(db, profile_id, queue_id, since_ms)
+    match_times = sorted([m.game_creation / 1000 for m in matches if m.game_creation])
+
+    # Simulate day-by-day from window_start to now
+    total_days = max(1, int((now - window_start) / 86400) + 1)
+    bank = initial_bank
+
+    for day_offset in range(total_days):
+        day_start = window_start + (day_offset * 86400)
         day_end = day_start + 86400
-        games_today = sum(1 for t in recent if day_start <= t < day_end)
+        games_today = sum(1 for t in match_times if day_start <= t < day_end)
 
         if games_today > 0:
-            bank = min(MAX_BANK, bank + games_today)
+            bank = min(max_bank, bank + (games_today * days_per_game))
         else:
             bank = max(0, bank - 1)
 
-    return bank
+    return {
+        "bank_days": bank,
+        "active": bank == 0,
+        "lp_per_day": lp_per_day,
+    }
+
+
+def _simulate_gm_demotion(match_dates: list, now: float) -> tuple:
+    """Day-by-day simulation of GM game count requirement.
+
+    Returns (demotion_days, games_to_safety):
+      - demotion_days: days from today until game count drops below 30 (without playing)
+      - games_to_safety: games needed today to push demotion 1+ day further
+    """
+    DAY = 86400
+    today_start = int(now // DAY) * DAY
+
+    # Simulate up to 22 days into the future (max window is 21 days)
+    demotion_days = None
+    for day_offset in range(22):
+        future_day = today_start + day_offset * DAY
+        window_start = future_day - 21 * DAY
+        count = sum(1 for d in match_dates if window_start <= d < future_day + DAY)
+        if count < 30:
+            demotion_days = day_offset
+            break
+
+    if demotion_days is None:
+        demotion_days = 22  # safe for longer than simulation window
+
+    # Calculate games_to_safety: how many games today to extend demotion by at least 1 day
+    games_to_safety = 0
+    if demotion_days < 22:
+        # Simulate: if we play N games "today", how does demotion_day shift?
+        for extra in range(1, 31):
+            # Add extra games at today's timestamp
+            test_dates = match_dates + [today_start + DAY // 2] * extra
+            new_demotion = None
+            for day_offset in range(22):
+                future_day = today_start + day_offset * DAY
+                window_start = future_day - 21 * DAY
+                count = sum(1 for d in test_dates if window_start <= d < future_day + DAY)
+                if count < 30:
+                    new_demotion = day_offset
+                    break
+            if new_demotion is None:
+                new_demotion = 22
+            if new_demotion > demotion_days:
+                games_to_safety = extra
+                break
+
+    return demotion_days, games_to_safety if games_to_safety > 0 else None
+
+
+def _compute_sc2_gm_info(
+    db: Session, profile_db_id: int, rank, region_id: int
+) -> dict:
+    """Compute GM tracking info for an SC2 rank.
+
+    For GM: day-by-day demotion simulation, games to extend safety, actual rank.
+    For Masters: MMR gap vs GM threshold, projected rank + demotion info if above threshold.
+    """
+    result = {}
+    ladder_data = crud.get_sc2_gm_ladder(db, region_id)
+    ladder_mmrs = ladder_data[1] if ladder_data else []
+    threshold = ladder_data[0] if ladder_data else None
+
+    now = time.time()
+
+    if rank.is_grandmaster:
+        three_weeks_ago = int(now) - (21 * 86400)
+        matches = crud.get_sc2_matches_since(db, profile_db_id, three_weeks_ago)
+        match_dates = [m.date for m in matches if m.date]
+
+        demotion_days, games_to_safety = _simulate_gm_demotion(match_dates, now)
+        result["gm_demotion_days"] = demotion_days
+        result["gm_games_to_safety"] = games_to_safety
+
+        # Compute actual GM rank from ladder MMRs
+        if ladder_mmrs:
+            result["gm_rank"] = sum(1 for m in ladder_mmrs if m > rank.mmr) + 1
+
+    elif rank.league and rank.league.lower() == "master":
+        if threshold is not None:
+            result["gm_mmr_threshold"] = threshold
+            result["mmr_above_gm"] = rank.mmr - threshold
+
+            # For Masters above threshold: projected rank + games toward 30-game promotion req
+            if rank.mmr >= threshold and ladder_mmrs:
+                result["gm_projected_rank"] = sum(1 for m in ladder_mmrs if m > rank.mmr) + 1
+                three_weeks_ago = int(now) - (21 * 86400)
+                matches = crud.get_sc2_matches_since(db, profile_db_id, three_weeks_ago)
+                result["gm_games_played_3weeks"] = len(matches)
+
+    return result
 
 
 _LP_PER_RANK = {"IV": 0, "III": 100, "II": 200, "I": 300}
@@ -172,10 +280,12 @@ def get_lol_dashboard_data() -> List[LoLProfileDTO]:
                 last_game_result=prof.last_game_result,
                 last_game_queue_id=prof.last_game_queue_id,
                 last_game_lp_change=prof.last_game_lp_change,
+                last_game_ended_at=prof.last_game_ended_at,
             )
 
             for rank in prof.ranks:
                 lp_delta = _compute_lp_delta(db, prof.id, rank.queue_type)
+                decay = _compute_lol_decay(db, prof.id, rank.tier, rank.queue_type, rank.decay_start)
                 rank_dto = RankDTO(
                     tier=rank.tier,
                     rank=rank.rank,
@@ -183,6 +293,9 @@ def get_lol_dashboard_data() -> List[LoLProfileDTO]:
                     wins=rank.wins,
                     losses=rank.losses,
                     lp_delta=lp_delta,
+                    decay_bank_days=decay["bank_days"],
+                    decay_active=decay["active"],
+                    decay_lp_per_day=decay["lp_per_day"],
                 )
                 if rank.queue_type == "RANKED_SOLO_5x5":
                     dto.solo_duo_rank = rank_dto
@@ -236,16 +349,28 @@ def get_sc2_dashboard_data() -> List[SC2AccountDTO]:
                     current_game_start=prof.current_game_start,
                     last_game_result=prof.last_game_result,
                     last_game_opponent=prof.last_game_opponent,
+                    last_game_ended_at=prof.last_game_ended_at,
+                    last_game_mmr_change=prof.last_game_mmr_change,
+                    last_game_mmr_race=prof.last_game_mmr_race,
+                    last_game_gm_rank_change=prof.last_game_gm_rank_change,
                 )
 
                 for rank in prof.ranks:
                     if rank.league and rank.league != "Unranked":
                         mmr_delta = _compute_mmr_delta(db, prof.id, rank.race)
+                        gm_info = _compute_sc2_gm_info(db, prof.id, rank, prof.region_id)
                         profile_dto.ranks[rank.race] = SC2RankDTO(
                             league=rank.league,
                             mmr=rank.mmr,
                             mmr_delta=mmr_delta,
                             is_grandmaster=bool(rank.is_grandmaster),
+                            gm_demotion_days=gm_info.get("gm_demotion_days"),
+                            gm_games_to_safety=gm_info.get("gm_games_to_safety"),
+                            gm_mmr_threshold=gm_info.get("gm_mmr_threshold"),
+                            mmr_above_gm=gm_info.get("mmr_above_gm"),
+                            gm_rank=gm_info.get("gm_rank"),
+                            gm_projected_rank=gm_info.get("gm_projected_rank"),
+                            gm_games_played_3weeks=gm_info.get("gm_games_played_3weeks"),
                         )
 
                 if prof.raw_data:
@@ -358,5 +483,23 @@ def delete_account(account_id: int) -> None:
     except Exception:
         db.rollback()
         raise
+    finally:
+        db.close()
+
+
+def get_gm_threshold_for_region(region_id: int) -> Optional[int]:
+    """Return the GM MMR threshold for a region, or None if not populated."""
+    db = SessionLocal()
+    try:
+        return crud.get_sc2_gm_threshold(db, region_id)
+    finally:
+        db.close()
+
+
+def get_sc2_season_info(region_id: int) -> Optional[dict]:
+    """Return season metadata for a region: {season_id, season_start, season_end}."""
+    db = SessionLocal()
+    try:
+        return crud.get_sc2_season_info(db, region_id)
     finally:
         db.close()
