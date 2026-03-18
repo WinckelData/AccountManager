@@ -32,6 +32,7 @@
 
 ---
 ## Backlog / Dump for unfinished Ideas)
+
 - Make everything more beautiful in the current CustomTKinter setup: Render Images nicer (Same Format as original not forced into Square), Make color schema nicer, improve visuals EVERYWHERE & make it look more CLEAN.
 - Make each account clickable (for both/All Games). We can move the option to delete there (less cluttering in the general overview)
 - Did we refactor fully?

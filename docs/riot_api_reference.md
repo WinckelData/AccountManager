@@ -48,7 +48,7 @@ If a request returns `429 Too Many Requests`, the `Retry-After` header dictates 
 ### A. Get Match IDs
 *   **Endpoint:** `GET /lol/match/v5/matches/by-puuid/{puuid}/ids`
 *   **Routing:** Regional
-*   **Query Params:** `start` (index, default 0), `count` (max 100), `startTime` (epoch seconds), `endTime` (epoch seconds).
+*   **Query Params:** `start` (index, default 0), `count` (max 100), `startTime` (epoch seconds), `endTime` (epoch seconds), `queue` (queue ID filter, e.g. `420` for Solo/Duo Ranked, `440` for Flex).
 *   **Purpose:** Retrieves an array of match IDs played by the specified player.
 
 ### B. Get Match Details

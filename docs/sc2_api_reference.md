@@ -42,7 +42,14 @@ Requests must be routed to the specific regional server where the profile reside
 
 #### 4. Get Ladder Summary
 * **Endpoint:** `GET /sc2/profile/:regionId/:realmId/:profileId/ladder/summary`
-* **Purpose:** Returns a list of `showCaseEntries` representing the player's active ladders (1v1, 2v2, Archon, etc.). Data includes `ladderId`, `leagueName`, `wins`, `losses`, `rank`, and the `favoriteRace`.
+* **Purpose:** Returns the player's active ladder placements.
+* **Response Fields:**
+  * `showCaseEntries` — **Capped at 3 entries.** Each entry contains a `team` object with `localizedGameMode` (e.g. `"1v1"`), `members` (with `favoriteRace`), plus top-level `ladderId`, `leagueName`, `wins`, `losses`, `rank`.
+  * `allLadderMemberships` — **Complete list** of all ladder memberships (not capped). Each entry has:
+    * `ladderId` — The ladder ID (can be used with Get Ladder Details).
+    * `localizedGameMode` — Format differs from showcase: includes league name, e.g. `"1v1 Master"`, `"1v1 Diamond"` (vs. showcase's plain `"1v1"`).
+    * `rank` — Player's rank within that ladder.
+  * **Usage note:** Since `showCaseEntries` is capped at 3, players with 4+ active 1v1 races will have ladders only visible in `allLadderMemberships`. Always check both fields for complete coverage.
 
 #### 5. Get Ladder Details
 * **Endpoint:** `GET /sc2/profile/:regionId/:realmId/:profileId/ladder/:ladderId`
@@ -115,8 +122,9 @@ _Measured 2026-03-15 using `tests/test_blizzard_rate_limits.py`_
 - With ~6–10 API calls per SC2 account sync, even 1,000 accounts can be synced comfortably within the hourly budget.
 
 ### Parallelism Recommendation
-- **3 workers** is a safe default for parallel SC2 sync (used in `data_updater.py`).
-- Could increase to 5–10 workers without risk of hitting rate limits for typical account counts.
+- **9 workers** is the current default for parallel SC2 account sync (`NUM_WORKERS_SC2` in `config.py`).
+- GM ladder + season prefetch runs in parallel (1 thread per region) before account sync begins.
+- Could increase account workers further without risk of hitting rate limits for typical account counts.
 
 ---
 
