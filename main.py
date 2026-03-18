@@ -27,11 +27,12 @@ class AccountManagerApp(ctk.CTk):
 
         # Live tracking
         self._live_tracker = LiveTracker()
+        self._sc2_blizz_client = None  # lazy init for SC2 post-game fetch
         self._sc2_live = SC2Live()
         if self.settings.get("lol_live_tracking", False):
             self._live_tracker.start()
         if self.settings.get("sc2_live_tracking", False):
-            self._sc2_live.start()
+            self._init_sc2_live()
 
         from src.data.database import engine, SessionLocal
         from src.data.models import Base  # noqa: registers ORM models
@@ -192,7 +193,7 @@ class AccountManagerApp(ctk.CTk):
         if self.current_game == "SC2":
             for acc in self.sc2_data:
                 for p in acc.profiles:
-                    state[p.profile_id] = (p.is_in_game, p.last_game_result)
+                    state[p.profile_id] = (p.is_in_game, p.last_game_result, p.last_game_mmr_change, p.last_game_gm_rank_change)
         elif self.current_game == "LoL":
             for p in self.lol_data:
                 state[p.puuid] = (p.is_in_game, p.last_game_result, p.last_game_lp_change)
@@ -353,12 +354,22 @@ class AccountManagerApp(ctk.CTk):
         else:
             self._live_tracker.stop()
 
+    def _init_sc2_live(self):
+        """Initialize SC2Live with a BlizzardClient for post-game MMR fetch."""
+        from dotenv import load_dotenv
+        from src.sc2.api_client import BlizzardClient
+        load_dotenv()
+        if not self._sc2_blizz_client:
+            self._sc2_blizz_client = BlizzardClient()
+        self._sc2_live = SC2Live(blizzard_client=self._sc2_blizz_client)
+        self._sc2_live.start()
+
     def _toggle_sc2_live_tracking(self, enabled: bool):
         self.settings["sc2_live_tracking"] = enabled
         with open(SETTINGS_PATH, "w") as f:
             json.dump(self.settings, f)
         if enabled:
-            self._sc2_live.start()
+            self._init_sc2_live()
         else:
             self._sc2_live.stop()
 
@@ -460,13 +471,8 @@ class AccountManagerApp(ctk.CTk):
                 if not card.winfo_exists() or not name_lbl.winfo_exists(): return
                 
                 self._apply_row_style(card, name_lbl, display_name, status, has_changes)
-                
+
                 if status == "DONE" and has_changes:
-                    # Refresh to show data
-                    self.load_data()
-                    if self.current_game == "SC2": self.show_sc2_view()
-                    elif self.current_game == "LoL": self.show_lol_view()
-                    
                     self.after(15000, lambda c=card, nl=name_lbl, orig=display_name, g=game: self._reset_row_highlight(c, nl, orig, g))
 
     def _apply_row_style(self, card, name_lbl, display_name, status, has_changes):
