@@ -2,6 +2,8 @@ import time
 import customtkinter as ctk
 
 from src.lol.live import QUEUE_NAMES
+from src.config import POST_GAME_PIN_TIMEOUT
+from src.ui.ui_utils import Tooltip
 
 
 def get_rank_sort_key(acc, rank_type):
@@ -89,6 +91,7 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
         else:
             container.sort_col = col
             container.sort_asc = False
+        container._pin_dismissed = True
         render_lol_view(container, data, copy_callback, add_callback, logo_img, row_widgets, delete_callback)
 
     if sort_col == "Riot ID":
@@ -98,9 +101,22 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
     elif sort_col == "Flex Rank":
         data.sort(key=lambda x: get_rank_sort_key(x, "flex"), reverse=not sort_asc)
 
+    # Reset pin dismissal when any account enters a game
+    if any(x.is_in_game for x in data):
+        container._pin_dismissed = False
+
     # Pin live and post-game accounts to top (only when live tracking is active)
-    if _live_enabled:
-        data.sort(key=lambda x: 0 if (x.is_in_game or x.last_game_result is not None) else 1)
+    if _live_enabled and not getattr(container, "_pin_dismissed", False):
+        now = time.time()
+        def _lol_pin_key(x):
+            if x.is_in_game:
+                return 0
+            if x.last_game_result is not None:
+                if x.last_game_ended_at and (now - x.last_game_ended_at) > POST_GAME_PIN_TIMEOUT:
+                    return 1  # expired
+                return 0
+            return 1
+        data.sort(key=_lol_pin_key)
 
     # Destroy non-row widgets; pack_forget row widgets
     for widget in container.winfo_children():
@@ -156,8 +172,8 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
 
     tier_colors = {
         "IRON": "gray50", "BRONZE": "#cd7f32", "SILVER": "gray75",
-        "GOLD": "#ffd700", "PLATINUM": "#00ced1", "EMERALD": "#50c878",
-        "DIAMOND": "#b9f2ff", "MASTER": "#ff00ff", "GRANDMASTER": "#ff4500",
+        "GOLD": "#ffd700", "PLATINUM": "#20b2aa", "EMERALD": "#2e8b57",
+        "DIAMOND": "#4a90d9", "MASTER": "#ff00ff", "GRANDMASTER": "#ff4500",
         "CHALLENGER": "#ffdf00", "UNRANKED": "gray40",
     }
 
@@ -204,10 +220,10 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
             # Post-game badge (ranked only)
             if acc.last_game_result == "Victory":
                 badge_icon = "\u2705"
-                badge_color = "#32cd32"
+                badge_color = ("gray10", "gray90")
             else:
                 badge_icon = "\u274c"
-                badge_color = "#ff6347"
+                badge_color = ("gray10", "gray90")
             badge_text = f" {badge_icon} {acc.last_game_result}"
             if acc.last_game_lp_change is not None:
                 sign = "+" if acc.last_game_lp_change >= 0 else ""
@@ -256,20 +272,26 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
 
                 # LP delta
                 if rank_data.lp_delta != 0:
-                    delta_color = "#32cd32" if rank_data.lp_delta > 0 else "#ff6347"
                     delta_sign = "+" if rank_data.lp_delta > 0 else ""
                     ctk.CTkLabel(top, text=f"  {delta_sign}{rank_data.lp_delta}",
-                                 text_color=delta_color,
+                                 text_color=("gray10", "gray90"),
                                  font=ctk.CTkFont(size=11)).pack(side="left")
 
                 bot = ctk.CTkFrame(cell, fg_color="transparent")
                 bot.pack(anchor="w")
                 total = rank_data.wins + rank_data.losses
                 wr = int((rank_data.wins / total) * 100) if total > 0 else 0
-                wr_color = "#ff4500" if wr >= 60 else "#32cd32" if wr >= 55 else "#ff6347" if wr < 48 else "gray50"
+                wr_color = ("gray10", "gray90")
                 ctk.CTkLabel(bot, text=f"W{rank_data.wins} L{rank_data.losses}  {wr}%",
                              text_color=wr_color,
                              font=ctk.CTkFont(size=11)).pack(side="left")
+
+                # Decay tooltip for Diamond+
+                if rank_data.decay_bank_days is not None:
+                    lines = [f"Decay Bank: {rank_data.decay_bank_days} days"]
+                    if rank_data.decay_active:
+                        lines.append("⚠ DECAY ACTIVE")
+                    Tooltip(cell, "\n".join(lines))
             else:
                 ctk.CTkLabel(cell, text="Unranked", text_color="gray50").pack(side="left")
 

@@ -1,8 +1,64 @@
+import tkinter as tk
 import customtkinter as ctk
 import threading
 import os
 import re
 from src.services.data_service import add_lol_account, add_sc2_account
+
+
+class Tooltip:
+    """Hover tooltip for any widget. Shows a small popup on mouse enter."""
+
+    def __init__(self, widget, text, delay_ms=400):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._tip_window = None
+        self._after_id = None
+        self._bind_recursive(widget)
+
+    def _bind_recursive(self, widget):
+        widget.bind("<Enter>", self._schedule_show)
+        widget.bind("<Leave>", self._hide)
+        widget.bind("<ButtonPress>", self._hide)
+        for child in widget.winfo_children():
+            self._bind_recursive(child)
+
+    def _schedule_show(self, event=None):
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self):
+        if self._after_id:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self):
+        if self._tip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+
+        self._tip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+
+        label = tk.Label(
+            tw, text=self.text, justify="left",
+            background="#2b2b2b", foreground="#e0e0e0",
+            relief="solid", borderwidth=1,
+            font=("Segoe UI", 10), padx=8, pady=4,
+        )
+        label.pack()
+
+    def _hide(self, event=None):
+        self._cancel()
+        if self._tip_window:
+            self._tip_window.destroy()
+            self._tip_window = None
+
+    def update_text(self, new_text):
+        self.text = new_text
 
 def get_sc2_account_folders():
     """Scans the SC2 Documents directory for root account folders."""

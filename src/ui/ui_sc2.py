@@ -1,5 +1,11 @@
 import time
+from datetime import datetime
 import customtkinter as ctk
+
+from src.ui.ui_utils import Tooltip
+from src.config import POST_GAME_PIN_TIMEOUT
+from src.services.data_service import get_gm_threshold_for_region, get_sc2_season_info
+
 
 def get_sc2_stats(acc, target_region, race):
     """
@@ -17,7 +23,12 @@ def get_sc2_stats(acc, target_region, race):
     ranks = prof.ranks
     if race_key in ranks and ranks[race_key].league != "Unranked":
         mmr = ranks[race_key].mmr
-        return (mmr, f"{mmr} MMR ({ranks[race_key].league})", True)
+        rank_dto = ranks[race_key]
+        if rank_dto.is_grandmaster and rank_dto.gm_rank is not None:
+            display = f"{mmr} MMR (GM #{rank_dto.gm_rank})"
+        else:
+            display = f"{mmr} MMR ({rank_dto.league})"
+        return (mmr, display, True)
         
     # Check history (History is still a dict parsed from raw JSON)
     history = prof.history
@@ -35,6 +46,24 @@ def get_sc2_stats(acc, target_region, race):
     return (0, "Unranked", False)
 
 
+def _render_gm_divider(container, threshold):
+    """Render a gold Grandmaster threshold divider with flanking lines."""
+    divider = ctk.CTkFrame(container, fg_color="transparent")
+    divider.pack(fill="x", pady=6, padx=20)
+    divider.grid_columnconfigure(0, weight=1)
+    divider.grid_columnconfigure(2, weight=1)
+
+    left_line = ctk.CTkFrame(divider, height=2, fg_color="#c9a027")
+    left_line.grid(row=0, column=0, sticky="ew", padx=(0, 8), pady=0)
+
+    label = ctk.CTkLabel(divider, text=f"Grandmaster Threshold ({threshold} MMR)",
+                         text_color="#c9a027", font=ctk.CTkFont(size=12, weight="bold"))
+    label.grid(row=0, column=1, padx=4)
+
+    right_line = ctk.CTkFrame(divider, height=2, fg_color="#c9a027")
+    right_line.grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=0)
+
+
 def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None, row_widgets=None,
                     live_tracking_enabled=False, live_tracking_toggle_cb=None):
     """Renders the SC2 account dashboard using the Compact Grid layout with Sorting and Spoilers."""
@@ -45,7 +74,7 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
     if not hasattr(container, "selected_server"):
         container.selected_server = "EU"
     if not hasattr(container, "selected_races"):
-        container.selected_races = {"Zerg": True, "Terran": False, "Protoss": False}
+        container.selected_races = {"Zerg": True, "Terran": False, "Protoss": False, "Random": False}
     # Persist live tracking state across internal re-renders
     if live_tracking_toggle_cb is not None:
         container._live_tracking_enabled = live_tracking_enabled
@@ -57,7 +86,7 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
     selected_races = container.selected_races
     
     # Active races ordered
-    race_order = ["Zerg", "Terran", "Protoss"]
+    race_order = ["Zerg", "Terran", "Protoss", "Random"]
     active_races = [r for r in race_order if selected_races.get(r, False)]
     
     # If no races selected, default back to Zerg to prevent empty UI
@@ -93,6 +122,7 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
         else:
             container.sort_col = col
             container.sort_asc = False
+        container._pin_dismissed = True
         render_sc2_view(container, data, copy_callback, add_callback, logo_img, row_widgets)
         
     def trigger_rerender():
@@ -139,15 +169,26 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
             reverse=not sort_asc
         )
 
+    # Reset pin dismissal when any account is in-game
+    for item in enriched_data:
+        for p in item["acc"].profiles:
+            if p.is_in_game:
+                container._pin_dismissed = False
+                break
+
     # Pin live or post-game accounts to top (only when live tracking is active)
-    if _live_enabled:
-        def _pin_key(x):
-            for p in x["acc"].profiles:
-                if p.is_in_game:
-                    return 0  # in-game: highest priority
-                if p.last_game_result is not None:
-                    return 0  # post-game result: keep pinned
-            return 1
+    now = time.time()
+    def _pin_key(x):
+        for p in x["acc"].profiles:
+            if p.is_in_game:
+                return 0  # in-game: highest priority
+            if p.last_game_result is not None:
+                if p.last_game_ended_at and (now - p.last_game_ended_at) > POST_GAME_PIN_TIMEOUT:
+                    continue  # expired
+                return 0  # post-game result: keep pinned
+        return 1
+
+    if _live_enabled and not getattr(container, "_pin_dismissed", False):
         enriched_data.sort(key=_pin_key)
 
     # Separate empty accounts after sorting
@@ -220,6 +261,46 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
                               command=lambda r_name=r, v=var: toggle_race(r_name, v.get()))
         chk.pack(side="left", padx=5)
 
+    # --- Season Label with Tooltip ---
+    season_info = get_sc2_season_info(target_region)
+    if season_info and season_info.get("season_id"):
+        season_lbl = ctk.CTkLabel(
+            filter_frame,
+            text=f"Season {season_info['season_id']}",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("gray30", "gray70"),
+        )
+        season_lbl.pack(side="right", padx=(10, 10))
+
+        tip_lines = []
+        now = time.time()
+        if season_info.get("season_start"):
+            tip_lines.append(f"Start: {datetime.fromtimestamp(season_info['season_start']).strftime('%Y-%m-%d')}")
+        if season_info.get("season_end"):
+            lock_epoch = season_info["season_end"] - 7 * 86400
+            end_epoch = season_info["season_end"]
+
+            lock_days = int((lock_epoch - now) / 86400)
+            lock_str = datetime.fromtimestamp(lock_epoch).strftime('%Y-%m-%d')
+            if lock_days > 0:
+                tip_lines.append(f"Lock:  {lock_str} ({lock_days} days)")
+            else:
+                tip_lines.append(f"Lock:  {lock_str} \u2705")
+
+            end_days = int((end_epoch - now) / 86400)
+            end_str = datetime.fromtimestamp(end_epoch).strftime('%Y-%m-%d')
+            if end_days > 0:
+                tip_lines.append(f"End:   {end_str} ({end_days} days)")
+            else:
+                tip_lines.append(f"End:   {end_str} \u2705")
+        if tip_lines:
+            Tooltip(season_lbl, "\n".join(tip_lines))
+
+    # Compute days until ladder lock (used for GM secured indicator)
+    lock_days_left = None
+    if season_info and season_info.get("season_end"):
+        lock_days_left = int((season_info["season_end"] - 7 * 86400 - time.time()) / 86400)
+
     # --- Table Headers ---
     table_header = ctk.CTkFrame(container, fg_color="transparent")
     table_header.pack(fill="x", pady=(0, 5), padx=5)
@@ -253,7 +334,7 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
 
     def create_card(parent, item, is_muted=False):
         account_id = item["account_id"]
-        
+
         if account_id in row_widgets:
             old_card = row_widgets[account_id]['card']
             if old_card.winfo_exists():
@@ -262,8 +343,25 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
                     return
                 else:
                     old_card.destroy()
-                
-        card = ctk.CTkFrame(parent, fg_color="transparent")
+
+        # Check if any race for this account is GM-secured (demotion timer >= lock days)
+        gm_secured = False
+        if not is_muted and lock_days_left is not None and lock_days_left > 0:
+            _check_prof = next(
+                (p for p in item["acc"].profiles if p.region == target_region), None
+            )
+            if _check_prof:
+                for r_key, r_dto in _check_prof.ranks.items():
+                    if (r_dto.is_grandmaster
+                            and r_dto.gm_demotion_days is not None
+                            and r_dto.gm_demotion_days >= lock_days_left):
+                        gm_secured = True
+                        break
+
+        if gm_secured:
+            card = ctk.CTkFrame(parent, fg_color="transparent", border_width=2, border_color="#c9a027")
+        else:
+            card = ctk.CTkFrame(parent, fg_color="transparent")
         card.pack(fill="x", pady=2, padx=5)
         
         card.grid_columnconfigure(0, weight=1, uniform="col")
@@ -302,9 +400,9 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
                              font=ctk.CTkFont(size=11, weight="bold")).pack(side="left", padx=(6, 0))
             elif result_profile:
                 result_map = {
-                    "Victory": ("✅ Victory", "#2ea043"),
-                    "Defeat": ("❌ Defeat", "#da3633"),
-                    "Tie": ("➖ Tie", "#d4a017"),
+                    "Victory": ("✅ Victory", ("gray10", "gray90")),
+                    "Defeat": ("❌ Defeat", ("gray10", "gray90")),
+                    "Tie": ("➖ Tie", ("gray10", "gray90")),
                 }
                 badge_text, badge_color = result_map.get(
                     result_profile.last_game_result, (result_profile.last_game_result, "gray50")
@@ -339,15 +437,84 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
                     timer_lbl.pack(side="left")
                     row_widgets[account_id]['timer_lbl'] = timer_lbl
 
+        # Find profile for selected region (for tooltip data)
+        _tooltip_prof = next(
+            (p for p in item["acc"].profiles if p.region == target_region), None
+        )
+
         for idx, race in enumerate(active_races):
             stats = item["stats"][race]
             r_color = ("gray10", "gray90") if stats["active"] else "gray50"
             if is_muted:
                 r_color = "gray60"
-                
-            lbl = ctk.CTkLabel(card, text=stats["str"], text_color=r_color, width=180, anchor="w")
-            lbl.grid(row=0, column=idx + 1, padx=15, pady=10, sticky="w")
+
+            # Golden text for GM-secured race columns
+            race_secured = False
+            if gm_secured and _tooltip_prof:
+                rank_dto_check = _tooltip_prof.ranks.get(race.lower())
+                if (rank_dto_check and rank_dto_check.is_grandmaster
+                        and rank_dto_check.gm_demotion_days is not None
+                        and lock_days_left is not None
+                        and rank_dto_check.gm_demotion_days >= lock_days_left):
+                    r_color = "#c9a027"
+                    race_secured = True
+
+            cell = ctk.CTkFrame(card, fg_color="transparent")
+            cell.grid(row=0, column=idx + 1, padx=15, pady=10, sticky="w")
+            top = ctk.CTkFrame(cell, fg_color="transparent")
+            top.pack(anchor="w")
+
+            lbl = ctk.CTkLabel(top, text=stats["str"], text_color=r_color, anchor="w")
+            lbl.pack(side="left")
             row_widgets[account_id]['race_lbls'][race] = lbl
+
+            # Post-game MMR delta inline (like LoL LP delta)
+            if (not is_muted and result_profile
+                    and result_profile.last_game_mmr_change is not None
+                    and stats["active"]
+                    and result_profile.last_game_mmr_race == race.lower()):
+                mmr_chg = result_profile.last_game_mmr_change
+                delta_color = ("gray10", "gray90")
+                delta_sign = "+" if mmr_chg >= 0 else ""
+                delta_text = f"  {delta_sign}{mmr_chg}"
+                # GM rank change
+                if result_profile.last_game_gm_rank_change is not None and _tooltip_prof:
+                    rank_dto = _tooltip_prof.ranks.get(race.lower())
+                    if rank_dto and rank_dto.is_grandmaster:
+                        rk_chg = result_profile.last_game_gm_rank_change
+                        rk_sign = "+" if rk_chg >= 0 else ""
+                        delta_text += f" ({rk_sign}#{abs(rk_chg)})"
+                ctk.CTkLabel(top, text=delta_text, text_color=delta_color,
+                             font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
+
+            # GM / Masters tooltip
+            if not is_muted and _tooltip_prof:
+                rank_dto = _tooltip_prof.ranks.get(race.lower())
+                if rank_dto:
+                    tip_lines = []
+                    if rank_dto.is_grandmaster and rank_dto.gm_demotion_days is not None:
+                        if race_secured:
+                            tip_lines.append("GM secured through season lock \u2705")
+                        else:
+                            if rank_dto.gm_demotion_days >= 22:
+                                tip_lines.append(f"Safe for 21+ days (without games)")
+                            elif rank_dto.gm_demotion_days <= 0:
+                                tip_lines.append("Demotion imminent! (< 30 games in window)")
+                            else:
+                                tip_lines.append(f"Demotion in {rank_dto.gm_demotion_days} day{'s' if rank_dto.gm_demotion_days != 1 else ''} (without games)")
+                            if rank_dto.gm_games_to_safety is not None and rank_dto.gm_games_to_safety > 0:
+                                tip_lines.append(f"Play {rank_dto.gm_games_to_safety} game{'s' if rank_dto.gm_games_to_safety != 1 else ''} to extend bank")
+                    elif rank_dto.gm_mmr_threshold is not None:
+                        if rank_dto.gm_projected_rank is not None:
+                            tip_lines.append(f"Projected GM Rank: #{rank_dto.gm_projected_rank}")
+                            if rank_dto.gm_games_played_3weeks is not None:
+                                tip_lines.append(f"Games for promotion: {rank_dto.gm_games_played_3weeks}/30")
+                        else:
+                            sign = "+" if rank_dto.mmr_above_gm >= 0 else ""
+                            tip_lines.append(f"GM threshold: {rank_dto.gm_mmr_threshold} MMR")
+                            tip_lines.append(f"MMR vs GM: {sign}{rank_dto.mmr_above_gm}")
+                    if tip_lines:
+                        Tooltip(lbl, "\n".join(tip_lines))
 
         email = item["acc"].email
         
@@ -363,9 +530,42 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
             
         copy_btn.grid(row=0, column=num_data_cols + 1, padx=15, pady=10, sticky="e")
 
+    # --- GM Threshold Divider ---
+    # Only show when sorting descending by MMR (default sort direction)
+    gm_divider_threshold = None
+    gm_divider_index = None
+    if sort_col != "Name" and not sort_asc:
+        gm_divider_threshold = get_gm_threshold_for_region(target_region)
+        if gm_divider_threshold is not None:
+            sort_race = sort_col.split(" ")[0]
+            # Count pinned accounts at the top so the divider skips them
+            pin_count = 0
+            if _live_enabled and not getattr(container, "_pin_dismissed", False):
+                for item in active_data:
+                    if _pin_key(item) == 0:
+                        pin_count += 1
+                    else:
+                        break  # pinned accounts are contiguous at top
+            for i, item in enumerate(active_data):
+                if i < pin_count:
+                    continue  # skip pinned accounts
+                item_mmr = item["stats"].get(sort_race, {}).get("mmr", 0)
+                if item_mmr < gm_divider_threshold:
+                    gm_divider_index = i
+                    break
+            # All ranked accounts are above threshold — place divider at the end
+            if gm_divider_index is None:
+                gm_divider_index = len(active_data)
+
     # --- Render Active Accounts ---
-    for item in active_data:
+    for i, item in enumerate(active_data):
+        if gm_divider_index is not None and i == gm_divider_index:
+            _render_gm_divider(container, gm_divider_threshold)
         create_card(container, item)
+
+    # Divider after all ranked accounts (all above threshold)
+    if gm_divider_index is not None and gm_divider_index == len(active_data):
+        _render_gm_divider(container, gm_divider_threshold)
 
     # --- Render Empty Accounts (Spoiler) ---
     if empty_data:
