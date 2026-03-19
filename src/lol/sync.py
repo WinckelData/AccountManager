@@ -88,6 +88,37 @@ class SyncEngine:
         print("Synchronization Complete!")
         print("=" * 50)
 
+    def sync_single(self, account_id: int, progress_callback=None):
+        """Sync a single LoL account by its DB account ID."""
+        db = SessionLocal()
+        try:
+            from src.data.models import Account
+            acc = db.get(Account, account_id)
+            if not acc or not acc.lol_profile:
+                return
+            acc_dict = {
+                "account_id": acc.id,
+                "account_name": acc.account_name,
+                "profile_id": acc.lol_profile.id,
+                "game_name": acc.lol_profile.game_name,
+                "tag_line": acc.lol_profile.tag_line,
+                "puuid": acc.lol_profile.puuid,
+            }
+        finally:
+            db.close()
+
+        client = RiotClient(primary_key=self.riot.keys[0].key)
+        db = SessionLocal()
+        try:
+            self._completed_count = 0
+            self._sync_single(db, client, acc_dict, progress_callback, total=1)
+        except Exception as e:
+            db.rollback()
+            print(f"[SyncEngine] Single sync error: {e}")
+            raise
+        finally:
+            db.close()
+
     def _sync_batch(self, accounts, client, progress_callback, total):
         db = SessionLocal()
         try:

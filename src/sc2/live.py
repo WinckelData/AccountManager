@@ -15,7 +15,8 @@ from the database. The non-matching player is the opponent.
 import json
 import threading
 import time
-from collections import Counter
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -134,14 +135,16 @@ class SC2Live:
             profiles = crud.get_all_sc2_display_names(db)
             player_names = [p.get("name", "") for p in players]
 
-            # Count how many tracked profiles share each matching display_name
-            name_counts = Counter(
-                p.display_name for p in profiles if p.display_name in player_names
-            )
+            # Count unique accounts per matching display_name
+            # Multiple profiles on the same account (different regions) are NOT ambiguous
+            name_to_accounts = defaultdict(set)
+            for p in profiles:
+                if p.display_name in player_names:
+                    name_to_accounts[p.display_name].add(p.account_id)
 
             for profile in profiles:
-                if profile.display_name in player_names and name_counts[profile.display_name] == 1:
-                    # Unique match — safe to show LIVE
+                if profile.display_name in player_names and len(name_to_accounts[profile.display_name]) == 1:
+                    # All profiles with this name belong to the same account — safe to show LIVE
                     opponents = [
                         p.get("name") for p in players
                         if p.get("name") != profile.display_name
@@ -161,9 +164,10 @@ class SC2Live:
                         clear_result=just_started,
                     )
                     if just_started:
-                        print(f"[SC2Live] {profile.display_name} in game vs {opponent_name}")
+                        print(f"[SC2Live] {profile.display_name} (profile_db_id={profile.id}, region={profile.region_id}) in game vs {opponent_name}")
                 else:
-                    # Ambiguous match or non-match — don't show LIVE
+                    if profile.display_name in player_names:
+                        print(f"[SC2Live] {profile.display_name} (profile_db_id={profile.id}) ambiguous — {len(name_to_accounts.get(profile.display_name, set()))} different accounts share this name")
                     crud.set_sc2_in_game_status(db, profile.id, False)
 
             db.commit()
@@ -194,9 +198,10 @@ class SC2Live:
             profiles = crud.get_all_sc2_display_names(db)
             player_names = [p.get("name", "") for p in players]
 
-            name_counts = Counter(
-                p.display_name for p in profiles if p.display_name in player_names
-            )
+            name_to_accounts = defaultdict(set)
+            for p in profiles:
+                if p.display_name in player_names:
+                    name_to_accounts[p.display_name].add(p.account_id)
 
             for profile in profiles:
                 if profile.display_name in player_names:
@@ -222,7 +227,7 @@ class SC2Live:
                         ]
                     opponent_name = opponents[0] if opponents else None
 
-                    is_ambiguous = name_counts[profile.display_name] > 1
+                    is_ambiguous = len(name_to_accounts[profile.display_name]) > 1
 
                     if not is_ambiguous:
                         # Unique match — set result immediately
@@ -293,7 +298,7 @@ class SC2Live:
         # Snapshot old MMR and GM ranks per profile before any re-fetches
         old_data = {}  # profile_db_id -> {race: mmr}
         old_gm_ranks = {}  # profile_db_id -> gm_rank (int or None)
-        regions = {region_id for _, _, region_id, _, _, _, _ in matched_profiles}
+
 
         db = SessionLocal()
         try:
@@ -316,29 +321,40 @@ class SC2Live:
         finally:
             db.close()
 
-        # Re-fetch GM ladder per region so gm_rank updates after the game
-        for region_id in regions:
-            try:
-                gm_data = blizz.get_grandmaster_ladder(region_id)
-                gm_mmrs = []
-                for team in gm_data.get("ladderTeams", []):
-                    mmr = team.get("mmr", 0)
-                    if mmr > 0:
-                        gm_mmrs.append(mmr)
-                if gm_mmrs:
-                    sorted_mmrs = sorted(gm_mmrs, reverse=True)
-                    db = SessionLocal()
-                    try:
-                        crud.upsert_sc2_gm_threshold(
-                            db, region_id, min(gm_mmrs), _json.dumps(sorted_mmrs),
-                        )
-                        db.commit()
-                    finally:
-                        db.close()
-                    reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(region_id, "?")
-                    print(f"[SC2Live] Refreshed GM ladder for {reg_name} ({len(gm_mmrs)} players)")
-            except Exception as e:
-                print(f"[SC2Live] Failed to refresh GM ladder for region {region_id}: {e}")
+        # Only refresh GM ladders for regions that have existing ranked data
+        ranked_regions = set()
+        for _, profile_db_id, region_id, _, _, _, _ in matched_profiles:
+            if old_data.get(profile_db_id):
+                ranked_regions.add(region_id)
+
+        if ranked_regions:
+            def _refresh_gm(rid):
+                try:
+                    gm_data = blizz.get_grandmaster_ladder(rid)
+                    gm_mmrs = []
+                    for team in gm_data.get("ladderTeams", []):
+                        mmr = team.get("mmr", 0)
+                        if mmr > 0:
+                            gm_mmrs.append(mmr)
+                    if gm_mmrs:
+                        sorted_mmrs = sorted(gm_mmrs, reverse=True)
+                        gm_db = SessionLocal()
+                        try:
+                            crud.upsert_sc2_gm_threshold(
+                                gm_db, rid, min(gm_mmrs), _json.dumps(sorted_mmrs),
+                            )
+                            gm_db.commit()
+                        finally:
+                            gm_db.close()
+                        reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(rid, "?")
+                        print(f"[SC2Live] Refreshed GM ladder for {reg_name} ({len(gm_mmrs)} players)")
+                except Exception as e:
+                    print(f"[SC2Live] Failed to refresh GM ladder for region {rid}: {e}")
+
+            with ThreadPoolExecutor(max_workers=len(ranked_regions)) as pool:
+                list(pool.map(_refresh_gm, ranked_regions))
+        else:
+            pass  # No ranked data — skip GM ladder refresh
 
         # Re-snapshot old MMR now that GM ladders are refreshed
         db = SessionLocal()
@@ -417,12 +433,15 @@ class SC2Live:
 
                     if current_season:
                         summary = blizz.get_ladder_summary(region_id, realm_id, raw_pid)
-                        if not summary or "error" in summary or not summary.get("showCaseEntries"):
-                            # Ladder endpoint failed or returned empty — mark region unavailable
+                        if not summary or "error" in summary:
+                            # Ladder endpoint actually failed — mark region unavailable
                             reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(region_id, "?")
                             if region_id not in ladder_unavailable_regions:
                                 print(f"[SC2Live] Ladder endpoint unavailable for {reg_name}, skipping ladder fetches for this region")
                                 ladder_unavailable_regions.add(region_id)
+                        elif not summary.get("showCaseEntries") and not summary.get("allLadderMemberships"):
+                            # Truly unranked — no data to fetch, but endpoint is fine
+                            pass
                         else:
                             db = SessionLocal()
                             try:
@@ -473,6 +492,13 @@ class SC2Live:
                                             best_race = race
                                             best_is_gm = is_gm
                                             best_new_mmr = mmr
+                                    elif old_mmr is None and mmr > 0:
+                                        # Newly ranked (placement) — treat full MMR as delta
+                                        if best_delta is None:
+                                            best_delta = mmr
+                                            best_race = race
+                                            best_is_gm = is_gm
+                                            best_new_mmr = mmr
 
                                 # showCaseEntries is capped at 3 — fetch extra 1v1 ladders from allLadderMemberships
                                 processed_ladder_ids = {entry.get("ladderId") for entry in summary.get("showCaseEntries", [])
@@ -514,6 +540,13 @@ class SC2Live:
                                                 delta = mmr - old_mmr
                                                 if best_delta is None or abs(delta) > abs(best_delta):
                                                     best_delta = delta
+                                                    best_race = race
+                                                    best_is_gm = is_gm
+                                                    best_new_mmr = mmr
+                                            elif old_mmr is None and mmr > 0:
+                                                # Newly ranked (placement)
+                                                if best_delta is None:
+                                                    best_delta = mmr
                                                     best_race = race
                                                     best_is_gm = is_gm
                                                     best_new_mmr = mmr
@@ -566,6 +599,14 @@ class SC2Live:
                             last_game_opponent=opponent_name,
                         )
                         print(f"[SC2Live] Recorded game result ({game_result}) without MMR delta (ladder unavailable)")
+                    else:
+                        # No MMR data (unranked / no ladder entries) — still record game result
+                        crud.set_sc2_in_game_status(
+                            db, profile_db_id, False,
+                            last_game_result=game_result,
+                            last_game_opponent=opponent_name,
+                        )
+                        print(f"[SC2Live] Recorded game result ({game_result}) without MMR data")
                     db.commit()
                 except Exception as e:
                     db.rollback()

@@ -299,3 +299,85 @@ def update_sc2_data(progress_callback=None):
 
     print("\n" + "=" * 60)
     print("SC2 Database successfully updated via ORM!")
+
+
+def update_sc2_single(account_id: int, progress_callback=None):
+    """Sync a single SC2 account by its DB account ID."""
+    import json
+    load_dotenv()
+
+    blizz = BlizzardClient()
+    if not blizz.access_token:
+        print("Failed to authenticate with Blizzard API.")
+        return
+
+    db = SessionLocal()
+    try:
+        from src.data.models import Account
+        acc = db.get(Account, account_id)
+        if not acc or not acc.sc2_profiles:
+            print(f"No SC2 account found with id {account_id}")
+            return
+
+        # Fetch season/GM caches for this account's regions
+        regions_seen = {p.region_id for p in acc.sc2_profiles}
+        season_cache = {}
+        gm_cache = {}
+
+        def _fetch_region_data(reg):
+            reg_name = {1: "NA", 2: "EU", 3: "KR"}.get(reg, "Unknown")
+            print(f"  -> Fetching season + GM ladder for region {reg_name}...")
+            season_data = blizz.get_current_season(reg)
+            season_id = season_data.get("seasonId") if season_data else None
+            gm_data = blizz.get_grandmaster_ladder(reg)
+            gm_ids = set()
+            gm_mmrs = []
+            for team in gm_data.get("ladderTeams", []):
+                mmr_val = team.get("mmr", 0)
+                if mmr_val > 0:
+                    gm_mmrs.append(mmr_val)
+                for member in team.get("teamMembers", []):
+                    gm_ids.add(str(member.get("id", "")))
+            return reg, season_id, gm_ids, gm_mmrs, season_data
+
+        with ThreadPoolExecutor(max_workers=len(regions_seen)) as region_pool:
+            for reg, season_id, gm_ids, gm_mmrs, season_data in region_pool.map(_fetch_region_data, regions_seen):
+                season_cache[reg] = season_id
+                gm_cache[reg] = gm_ids
+                if gm_mmrs:
+                    sorted_mmrs = sorted(gm_mmrs, reverse=True)
+                    s_start = season_data.get("startDate") if season_data else None
+                    s_end = season_data.get("endDate") if season_data else None
+                    crud.upsert_sc2_gm_threshold(
+                        db, reg, min(gm_mmrs), json.dumps(sorted_mmrs),
+                        season_id=season_id, season_start=s_start, season_end=s_end,
+                    )
+        db.commit()
+
+        acc_dict = {
+            "account_id": acc.id,
+            "account_name": acc.account_name,
+            "folder_id": acc.folder_id,
+            "profiles": [
+                {
+                    "id": p.id,
+                    "profile_id": p.profile_id,
+                    "region_id": p.region_id,
+                    "realm_id": p.realm_id,
+                    "display_name": p.display_name,
+                }
+                for p in acc.sc2_profiles
+            ],
+        }
+    finally:
+        db.close()
+
+    def wrapped_progress(account_id_str, status, has_changes, _cur, _tot):
+        if progress_callback:
+            progress_callback(account_id_str, status, has_changes, 1 if status == "DONE" else 0, 1)
+
+    account_id_str, has_changes = _sync_single_sc2(
+        acc_dict, blizz, season_cache, gm_cache, wrapped_progress, 1
+    )
+    wrapped_progress(account_id_str, "DONE", has_changes, 0, 1)
+    print(f"[SC2 Sync] Single account '{acc_dict['account_name']}' done.")

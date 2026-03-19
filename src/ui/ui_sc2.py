@@ -1,10 +1,16 @@
 import time
 from datetime import datetime
 import customtkinter as ctk
+from PIL import Image
 
 from src.ui.ui_utils import Tooltip
-from src.config import POST_GAME_PIN_TIMEOUT
+from src.config import BASE_DIR, POST_GAME_PIN_TIMEOUT
 from src.services.data_service import get_gm_threshold_for_region, get_sc2_season_info
+
+_ICON_SIZE = (18, 18)
+_icon_copy = ctk.CTkImage(Image.open(BASE_DIR / "assets/Copy_Icon.png"), size=_ICON_SIZE)
+_icon_refresh = ctk.CTkImage(Image.open(BASE_DIR / "assets/Update_Icon.png"), size=_ICON_SIZE)
+_icon_delete = ctk.CTkImage(Image.open(BASE_DIR / "assets/Delete_Icon.png"), size=_ICON_SIZE)
 
 
 def get_sc2_stats(acc, target_region, race):
@@ -64,7 +70,34 @@ def _render_gm_divider(container, threshold):
     right_line.grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=0)
 
 
+def _confirm_delete(parent, name, on_confirm):
+    """Show a modal confirmation dialog. Calls on_confirm() if user clicks Delete."""
+    dialog = ctk.CTkToplevel(parent)
+    dialog.title("Confirm Delete")
+    dialog.geometry("340x150")
+    dialog.resizable(False, False)
+    dialog.grab_set()
+
+    ctk.CTkLabel(dialog, text=f"Delete '{name}'?",
+                 font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(20, 6))
+    ctk.CTkLabel(dialog, text="This cannot be undone.",
+                 text_color="gray50", font=ctk.CTkFont(size=12)).pack()
+
+    btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    btn_row.pack(pady=16)
+
+    def do_delete():
+        dialog.destroy()
+        on_confirm()
+
+    ctk.CTkButton(btn_row, text="Delete", fg_color="gray25", hover_color="gray40",
+                  width=100, command=do_delete).pack(side="left", padx=8)
+    ctk.CTkButton(btn_row, text="Cancel", fg_color="gray30", hover_color="gray40",
+                  width=100, command=dialog.destroy).pack(side="left", padx=8)
+
+
 def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None, row_widgets=None,
+                    delete_callback=None, refresh_callback=None,
                     live_tracking_enabled=False, live_tracking_toggle_cb=None):
     """Renders the SC2 account dashboard using the Compact Grid layout with Sorting and Spoilers."""
     if row_widgets is None:
@@ -123,12 +156,15 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
             container.sort_col = col
             container.sort_asc = False
         container._pin_dismissed = True
-        render_sc2_view(container, data, copy_callback, add_callback, logo_img, row_widgets)
+        render_sc2_view(container, data, copy_callback, add_callback, logo_img, row_widgets,
+                            delete_callback, refresh_callback)
         
     def trigger_rerender():
-        render_sc2_view(container, data, copy_callback, add_callback, logo_img, row_widgets)
+        render_sc2_view(container, data, copy_callback, add_callback, logo_img, row_widgets,
+                            delete_callback, refresh_callback)
 
     # --- Data Parsing & Enrichment ---
+    now = time.time()
     enriched_data = []
     for i, acc in enumerate(data):
         name = acc.account_name
@@ -153,6 +189,19 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
                 is_empty = False
                 
         item_data["is_empty"] = is_empty
+
+        # Auto-promote live/post-game accounts out of spoiler
+        if is_empty and _live_enabled:
+            for p in acc.profiles:
+                if p.is_in_game:
+                    is_empty = False
+                    break
+                if p.last_game_result is not None:
+                    if not p.last_game_ended_at or (now - p.last_game_ended_at) <= POST_GAME_PIN_TIMEOUT:
+                        is_empty = False
+                        break
+            item_data["is_empty"] = is_empty
+
         enriched_data.append(item_data)
 
     # --- Sorting Logic ---
@@ -177,7 +226,6 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
                 break
 
     # Pin live or post-game accounts to top (only when live tracking is active)
-    now = time.time()
     def _pin_key(x):
         for p in x["acc"].profiles:
             if p.is_in_game:
@@ -330,7 +378,7 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
         col_name = f"{race} MMR ({selected_server})"
         create_header_btn(table_header, col_name, col_name, idx + 1, 180)
         
-    ctk.CTkLabel(table_header, text="", width=110).grid(row=0, column=num_data_cols + 1, padx=15)
+    ctk.CTkLabel(table_header, text="", width=230).grid(row=0, column=num_data_cols + 1, padx=15)
 
     def create_card(parent, item, is_muted=False):
         account_id = item["account_id"]
@@ -367,7 +415,7 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
         card.grid_columnconfigure(0, weight=1, uniform="col")
         for c in range(1, num_data_cols + 1):
             card.grid_columnconfigure(c, weight=1, uniform="col")
-        card.grid_columnconfigure(num_data_cols + 1, weight=0, minsize=140)
+        card.grid_columnconfigure(num_data_cols + 1, weight=0, minsize=260)
         
         row_widgets[account_id] = {
             'card': card,
@@ -517,18 +565,36 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
                         Tooltip(lbl, "\n".join(tip_lines))
 
         email = item["acc"].email
-        
+        db_account_id = item["acc"].account_id
+
+        # --- Button cell: Copy + Refresh + Delete ---
+        btn_cell = ctk.CTkFrame(card, fg_color="transparent")
+        btn_cell.grid(row=0, column=num_data_cols + 1, padx=15, pady=10, sticky="e")
+
         if is_muted:
-            copy_btn = ctk.CTkButton(card, text="📋 Copy Email", width=110, 
-                                     fg_color="transparent", hover_color="gray25", 
-                                     border_width=1, border_color="gray30",
-                                     text_color="gray60",
-                                     command=lambda e=email: copy_callback(e))
+            ctk.CTkButton(btn_cell, text=" Copy Email", image=_icon_copy, compound="left", width=110,
+                          fg_color="transparent", hover_color="gray25",
+                          border_width=1, border_color="gray30",
+                          text_color="gray60",
+                          command=lambda e=email: copy_callback(e)
+                          ).pack(side="left", padx=(0, 6))
         else:
-            copy_btn = ctk.CTkButton(card, text="📋 Copy Email", width=110, 
-                                     command=lambda e=email: copy_callback(e))
-            
-        copy_btn.grid(row=0, column=num_data_cols + 1, padx=15, pady=10, sticky="e")
+            ctk.CTkButton(btn_cell, text=" Copy Email", image=_icon_copy, compound="left", width=110,
+                          command=lambda e=email: copy_callback(e)
+                          ).pack(side="left", padx=(0, 6))
+
+        if refresh_callback:
+            ctk.CTkButton(btn_cell, text="", image=_icon_refresh, width=36,
+                          fg_color="gray25", hover_color="gray40",
+                          command=lambda aid=db_account_id: refresh_callback(aid)
+                          ).pack(side="left", padx=(0, 4))
+
+        if delete_callback:
+            ctk.CTkButton(btn_cell, text="", image=_icon_delete, width=36,
+                          fg_color="gray25", hover_color="gray40",
+                          command=lambda n=item["name"], aid=db_account_id: _confirm_delete(
+                              container, n, lambda: delete_callback(aid)
+                          )).pack(side="left")
 
     # --- GM Threshold Divider ---
     # Only show when sorting descending by MMR (default sort direction)
@@ -573,7 +639,8 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
         
         def toggle_spoiler():
             container.spoiler_open = not getattr(container, "spoiler_open", False)
-            render_sc2_view(container, data, copy_callback, add_callback, logo_img, row_widgets)
+            render_sc2_view(container, data, copy_callback, add_callback, logo_img, row_widgets,
+                            delete_callback, refresh_callback)
             
         arrow = "▲" if spoiler_state else "▼"
         spoiler_btn = ctk.CTkButton(container, text=f"{arrow} Unranked Accounts ({len(empty_data)})", 

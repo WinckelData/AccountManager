@@ -88,4 +88,5 @@ class SC2AccountDTO:
     account_name: str
     email: str
     account_folder_id: str
+    account_id: int = 0
     profiles: List[SC2ProfileDTO] = field(default_factory=list)

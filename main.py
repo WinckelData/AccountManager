@@ -7,7 +7,7 @@ from src.ui.ui_utils import open_add_modal
 from src.ui.ui_lol import render_lol_view
 from src.ui.ui_sc2 import render_sc2_view
 from src.config import BASE_DIR, SETTINGS_PATH
-from src.sc2.sync import update_sc2_data
+from src.sc2.sync import update_sc2_data, update_sc2_single
 from src.lol.sync import SyncEngine
 from src.lol.live import LiveTracker
 from src.sc2.live import SC2Live
@@ -53,10 +53,10 @@ class AccountManagerApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
 
         # --- Assets ---
-        self.img_lol_side = self.load_image("assets/lol_icon.png", (128, 128))
-        self.img_sc2_side = self.load_image("assets/sc2_icon.png", (128, 128))
-        self.img_lol_head = self.load_image("assets/lol_icon.png", (72, 72))
-        self.img_sc2_head = self.load_image("assets/sc2_icon.png", (72, 72))
+        self.img_lol_side = self.load_image("assets/lol_icon.png", (180, 180))
+        self.img_sc2_side = self.load_image("assets/sc2_icon.png", (180, 180))
+        self.img_lol_head = self.load_image("assets/lol_icon.png", (140, 50))
+        self.img_sc2_head = self.load_image("assets/sc2_icon.png", (140, 50))
 
         # --- Sidebar ---
         self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0)
@@ -67,12 +67,12 @@ class AccountManagerApp(ctk.CTk):
         # Stacked XL Buttons
         self.btn_lol = ctk.CTkButton(self.sidebar, text="League of Legends", image=self.img_lol_side,
                                      compound="top", font=ctk.CTkFont(size=14, weight="bold"),
-                                     width=200, height=180, command=self.show_lol_view)
+                                     width=200, height=140, command=self.show_lol_view)
         self.btn_lol.pack(pady=10, padx=20)
 
         self.btn_sc2 = ctk.CTkButton(self.sidebar, text="StarCraft II", image=self.img_sc2_side,
                                      compound="top", font=ctk.CTkFont(size=14, weight="bold"),
-                                     width=200, height=180, command=self.show_sc2_view)
+                                     width=200, height=140, command=self.show_sc2_view)
         self.btn_sc2.pack(pady=10, padx=20)
 
         # Bottom Sidebar Info
@@ -103,10 +103,12 @@ class AccountManagerApp(ctk.CTk):
         self._live_refresh_loop()
 
     # --- Helper Logic ---
-    def load_image(self, rel_path, size):
+    def load_image(self, rel_path, max_size):
         path = BASE_DIR / rel_path
         if path.exists():
-            return ctk.CTkImage(Image.open(path), size=size)
+            img = Image.open(path)
+            img.thumbnail(max_size, Image.LANCZOS)
+            return ctk.CTkImage(img, size=img.size)
         return None
 
     def load_data(self):
@@ -254,6 +256,13 @@ class AccountManagerApp(ctk.CTk):
                 self.load_data()
                 new_state = self._get_live_state()
 
+                # Diagnostic: log when live-relevant state exists
+                in_game_ids = [k for k, v in new_state.items() if v[0]]
+                has_result = any(v[1] is not None for v in new_state.values())
+                if in_game_ids or has_result:
+                    changed = new_state != prev_state
+                    # print(f"[LiveRefresh] {game} state: {len(in_game_ids)} in-game, has_result={has_result}, changed={changed}")
+
                 if new_state != prev_state:
                     # State changed — full re-render
                     if game == "LoL":
@@ -266,6 +275,8 @@ class AccountManagerApp(ctk.CTk):
                 # else: no live accounts, skip
 
                 self._prev_live_state = new_state
+            elif is_live and self.updating.get(game, False):
+                # print(f"[LiveRefresh] Skipped — {game} update in progress")
         except Exception as e:
             print(f"[LiveRefresh] Error: {e}")
         self.after(10_000, self._live_refresh_loop)
@@ -297,10 +308,11 @@ class AccountManagerApp(ctk.CTk):
             self.img_lol_head,
             self.lol_row_widgets,
             delete_callback=self.delete_lol_account,
+            refresh_callback=self.refresh_single_lol_account,
             live_tracking_enabled=self.settings.get("lol_live_tracking", False),
             live_tracking_toggle_cb=self._toggle_lol_live_tracking,
         )
-        
+
         if hasattr(self, 'update_status') and "LoL" in self.update_status:
             for acc_id, state in self.update_status["LoL"].items():
                 if acc_id in self.lol_row_widgets:
@@ -333,6 +345,8 @@ class AccountManagerApp(ctk.CTk):
             lambda: open_add_modal(self),
             self.img_sc2_head,
             self.sc2_row_widgets,
+            delete_callback=self.delete_sc2_account,
+            refresh_callback=self.refresh_single_sc2_account,
             live_tracking_enabled=self.settings.get("sc2_live_tracking", False),
             live_tracking_toggle_cb=self._toggle_sc2_live_tracking,
         )
@@ -385,6 +399,47 @@ class AccountManagerApp(ctk.CTk):
             db.close()
         self.load_data()
         self.show_lol_view()
+
+    def delete_sc2_account(self, account_id: int):
+        from src.data.database import SessionLocal
+        from src.data import crud
+        db = SessionLocal()
+        try:
+            crud.delete_account(db, account_id)
+            db.commit()
+        finally:
+            db.close()
+        self.load_data()
+        self.show_sc2_view()
+
+    def refresh_single_lol_account(self, account_id: int):
+        if self.updating["LoL"]:
+            return
+        threading.Thread(target=self._run_single_sync, args=("LoL", account_id), daemon=True).start()
+
+    def refresh_single_sc2_account(self, account_id: int):
+        if self.updating["SC2"]:
+            return
+        threading.Thread(target=self._run_single_sync, args=("SC2", account_id), daemon=True).start()
+
+    def _run_single_sync(self, game, account_id):
+        try:
+            if game == "LoL":
+                engine = SyncEngine()
+                engine.sync_single(account_id)
+            else:
+                update_sc2_single(account_id)
+            self.after(0, self._on_single_sync_done, game)
+        except Exception as e:
+            print(f"Single sync failed for {game} account {account_id}: {e}")
+            self.after(0, self._on_single_sync_done, game)
+
+    def _on_single_sync_done(self, game):
+        self.load_data()
+        if game == "LoL" and self.current_game == "LoL":
+            self.show_lol_view()
+        elif game == "SC2" and self.current_game == "SC2":
+            self.show_sc2_view()
 
     def copy_to_clipboard(self, text):
         if not text:

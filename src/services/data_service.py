@@ -327,6 +327,7 @@ def get_sc2_dashboard_data() -> List[SC2AccountDTO]:
                 account_name=acc.account_name,
                 email=acc.login_name or "",
                 account_folder_id=acc.folder_id or "0",
+                account_id=acc.id,
             )
 
             for prof in acc.sc2_profiles:

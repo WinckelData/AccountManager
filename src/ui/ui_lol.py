@@ -1,9 +1,17 @@
+import re
 import time
 import customtkinter as ctk
+from PIL import Image
 
 from src.lol.live import QUEUE_NAMES
-from src.config import POST_GAME_PIN_TIMEOUT
+from src.config import BASE_DIR, POST_GAME_PIN_TIMEOUT
+from src.static_data import StaticDataManager
 from src.ui.ui_utils import Tooltip
+
+_ICON_SIZE = (18, 18)
+_icon_copy = ctk.CTkImage(Image.open(BASE_DIR / "assets/Copy_Icon.png"), size=_ICON_SIZE)
+_icon_refresh = ctk.CTkImage(Image.open(BASE_DIR / "assets/Update_Icon.png"), size=_ICON_SIZE)
+_icon_delete = ctk.CTkImage(Image.open(BASE_DIR / "assets/Delete_Icon.png"), size=_ICON_SIZE)
 
 
 def get_rank_sort_key(acc, rank_type):
@@ -70,7 +78,8 @@ def _confirm_delete(parent, name, on_confirm):
 
 
 def render_lol_view(container, data, copy_callback, add_callback, logo_img=None, row_widgets=None,
-                    delete_callback=None, live_tracking_enabled=False, live_tracking_toggle_cb=None):
+                    delete_callback=None, refresh_callback=None,
+                    live_tracking_enabled=False, live_tracking_toggle_cb=None):
     """Renders the LoL account dashboard with header and add button using DTOs."""
     if row_widgets is None:
         row_widgets = {}
@@ -168,7 +177,18 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
     create_header_btn(table_header, "Riot ID", "Riot ID", 0)
     create_header_btn(table_header, "Solo/Duo Rank", "Solo/Duo Rank", 1)
     create_header_btn(table_header, "Flex Rank", "Flex Rank", 2)
-    ctk.CTkLabel(table_header, text="", width=110).grid(row=0, column=3, padx=15)
+    # --- Season / Patch label (right side of header row) ---
+    _version = StaticDataManager().get_latest_version()
+    if _version:
+        m = re.match(r"(\d+)\.\d+\.\d+", _version)
+        _season_text = f"Season {m.group(1)} · Patch {_version}" if m else f"Patch {_version}"
+        ctk.CTkLabel(
+            table_header, text=_season_text,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("gray30", "gray70"),
+        ).grid(row=0, column=3, sticky="e", padx=15)
+    else:
+        ctk.CTkLabel(table_header, text="", width=110).grid(row=0, column=3, padx=15)
 
     tier_colors = {
         "IRON": "gray50", "BRONZE": "#cd7f32", "SILVER": "gray75",
@@ -298,16 +318,23 @@ def render_lol_view(container, data, copy_callback, add_callback, logo_img=None,
         build_rank_cell(acc.solo_duo_rank, 1)
         build_rank_cell(acc.flex_rank, 2)
 
-        # --- Column 3: Copy + Delete buttons ---
+        # --- Column 3: Copy + Refresh + Delete buttons ---
         btn_cell = ctk.CTkFrame(card, fg_color="transparent")
         btn_cell.grid(row=0, column=3, padx=15, pady=10, sticky="e")
 
-        ctk.CTkButton(btn_cell, text="📋 Copy Login", width=110,
+        ctk.CTkButton(btn_cell, text=" Copy Login", image=_icon_copy, compound="left", width=110,
                       command=lambda ln=acc.login_name: copy_callback(ln)
                       ).pack(side="left", padx=(0, 6))
 
+        if refresh_callback:
+            ctk.CTkButton(btn_cell, text="", image=_icon_refresh, width=36,
+                          fg_color="gray25", hover_color="gray40",
+                          command=lambda a=acc: refresh_callback(a.account_id)
+                          ).pack(side="left", padx=(0, 4))
+
         if delete_callback:
-            ctk.CTkButton(btn_cell, text="🗑", width=36, fg_color="gray25", hover_color="#8b1a1a",
+            ctk.CTkButton(btn_cell, text="", image=_icon_delete, width=36,
+                          fg_color="gray25", hover_color="gray40",
                           command=lambda a=acc: _confirm_delete(
                               container, a.account_name, lambda: delete_callback(a.account_id)
                           )).pack(side="left")
