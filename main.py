@@ -276,6 +276,7 @@ class AccountManagerApp(ctk.CTk):
 
                 self._prev_live_state = new_state
             elif is_live and self.updating.get(game, False):
+                pass
                 # print(f"[LiveRefresh] Skipped — {game} update in progress")
         except Exception as e:
             print(f"[LiveRefresh] Error: {e}")
