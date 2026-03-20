@@ -7,6 +7,11 @@ class RateLimitExhaustedException(Exception):
     pass
 
 
+class NetworkError(Exception):
+    """Raised when _request exhausts all retries due to network/server errors."""
+    pass
+
+
 class KeyState:
     def __init__(self, key):
         self.key = key
@@ -97,18 +102,19 @@ class RiotClient:
                 elif response.status_code == 404:
                     return None
                 else:
-                    print(f"[RiotClient] {response.status_code} for {url}: {response.text[:200]}")
+                    body = response.text[:80].replace('\n', ' ').strip()
+                    print(f"[RiotClient] {response.status_code} for {url}: {body}")
                     if attempt < max_retries - 1:
                         wait = 2 ** attempt
                         time.sleep(wait)
 
             except requests.exceptions.RequestException as e:
-                print(f"[RiotClient] Network error (attempt {attempt + 1}): {e}")
+                err_msg = str(e).split('\n')[0][:120]
+                print(f"[RiotClient] Network error (attempt {attempt + 1}): {err_msg}")
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
 
-        print(f"[RiotClient] All {max_retries} attempts failed for {url}")
-        return None
+        raise NetworkError(f"All {max_retries} attempts failed for {url}")
 
     # --- Endpoints ---
 
