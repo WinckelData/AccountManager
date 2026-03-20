@@ -12,7 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
-from src.lol.api_client import RiotClient
+from src.lol.api_client import RiotClient, NetworkError
 from src.data.database import SessionLocal
 from src.data import crud
 
@@ -32,6 +32,7 @@ RANKED_QUEUES = {
 class LiveTracker:
     POLL_INTERVAL_IDLE = 150   # seconds when no active games
     POLL_INTERVAL_ACTIVE = 30  # seconds when games are in progress
+    POLL_INTERVAL_NETWORK_DOWN = 300  # 5 minutes when network is unreachable
 
     def __init__(self):
         load_dotenv()
@@ -41,6 +42,7 @@ class LiveTracker:
         self._thread: threading.Thread | None = None
         self._active_games: dict[int, dict] = {}  # profile_id -> game metadata
         self._post_game_executor = ThreadPoolExecutor(max_workers=1)
+        self._network_down = False
 
     def start(self):
         if self._running:
@@ -81,6 +83,8 @@ class LiveTracker:
 
     @property
     def _poll_interval(self) -> int:
+        if self._network_down:
+            return self.POLL_INTERVAL_NETWORK_DOWN
         return self.POLL_INTERVAL_ACTIVE if self._active_games else self.POLL_INTERVAL_IDLE
 
     def _poll_loop(self):
@@ -97,6 +101,9 @@ class LiveTracker:
                 time.sleep(1)
 
     def _poll_all(self):
+        was_down = self._network_down
+        self._network_down = False
+
         db = SessionLocal()
         try:
             accounts = crud.get_tracked_accounts(db, game_type="LOL")
@@ -166,9 +173,19 @@ class LiveTracker:
 
                     # Not in-game and wasn't tracked — no-op
 
+                except NetworkError:
+                    # Network is down — do NOT trigger game-end transitions.
+                    self._network_down = True
+                    if not was_down:
+                        print("[LiveTracker] Network unavailable, suspending live polling.")
+                    break
+
                 except Exception as e:
                     db.rollback()
                     print(f"[LiveTracker] Error polling {profile.game_name}: {e}")
+
+            if was_down and not self._network_down:
+                print("[LiveTracker] Network recovered, resuming normal polling.")
 
             # Clean up _active_games for profiles that are no longer tracked
             stale = set(self._active_games.keys()) - polled_profile_ids
@@ -285,6 +302,14 @@ class LiveTracker:
             db.commit()
             print(f"[LiveTracker] Post-game complete for {name_tag}: {result}, LP: {lp_change}")
 
+        except NetworkError:
+            db.rollback()
+            print(f"[LiveTracker] Network unavailable during post-game for {name_tag}. Will retry on next sync.")
+            try:
+                crud.set_lol_in_game_status(db, profile_id, False)
+                db.commit()
+            except Exception:
+                db.rollback()
         except Exception as e:
             db.rollback()
             print(f"[LiveTracker] Post-game error for {name_tag}: {e}")
