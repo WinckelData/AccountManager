@@ -394,7 +394,7 @@ def add_lol_account(login_name: str, game_name: str, tag_line: str) -> Tuple[boo
 
     Returns (success, error_message).
     """
-    from src.lol.api_client import RiotClient
+    from src.lol.api_client import RiotClient, NetworkError
 
     client = RiotClient(
         primary_key=os.getenv("RIOT_API_KEY_PRIMARY"),
@@ -411,7 +411,10 @@ def add_lol_account(login_name: str, game_name: str, tag_line: str) -> Tuple[boo
     else:
         region = "europe"
 
-    account_data = client.get_puuid_by_riot_id(region, game_name, tag_line)
+    try:
+        account_data = client.get_puuid_by_riot_id(region, game_name, tag_line)
+    except NetworkError:
+        return False, "Network Error: Could not reach Riot API."
     if not account_data or "puuid" not in account_data:
         return False, "API Error: Could not resolve Riot ID."
 
