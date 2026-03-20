@@ -441,6 +441,11 @@ def render_sc2_view(container, data, copy_callback, add_callback, logo_img=None,
         name_lbl.pack(side="left")
         row_widgets[account_id]['name_lbl'] = name_lbl
 
+        if acc_obj.email:
+            ctk.CTkLabel(name_cell, text=acc_obj.email.split("@")[0],
+                         font=ctk.CTkFont(size=11),
+                         text_color="gray50").pack(anchor="w", pady=0)
+
         if not is_muted:
             if in_game_profile:
                 ctk.CTkLabel(name_row, text=" 🔴 LIVE",
